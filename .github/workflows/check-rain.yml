@@ -2,7 +2,7 @@ name: Rain Alert Automation
 
 on:
   schedule:
-    - cron: "0,30 * * * *"
+    - cron: "* * * * *"
   workflow_dispatch:
 
 permissions:

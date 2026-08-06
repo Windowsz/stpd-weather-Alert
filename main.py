@@ -187,14 +187,18 @@ def get_telegram_updates(bot_token, offset=None):
 
 
 def load_state():
-    """Load the last processed Telegram update_id from disk."""
+    """Load persisted state (last processed Telegram update_id, last home
+    alert sent) from disk."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                state = json.load(f)
+                state.setdefault("last_update_id", None)
+                state.setdefault("last_home_alert_time", None)
+                return state
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read state file, starting fresh: %s", exc)
-    return {"last_update_id": None}
+    return {"last_update_id": None, "last_home_alert_time": None}
 
 
 def save_state(state):
@@ -285,8 +289,12 @@ def extract_query_location(message):
     return extract_plain_latlon(text)
 
 
-def check_home_alert(bot_token, chat_id):
-    """Check the home location and send an alert if rain is likely soon."""
+def check_home_alert(bot_token, chat_id, state):
+    """Check the home location and send an alert if rain is likely soon.
+
+    Sends at most one alert per forecast hour-slot (tracked in `state`), so
+    running this frequently (e.g. every minute) doesn't spam repeat alerts
+    while the same rainy hour is still being forecast."""
     try:
         data = fetch_forecast(LATITUDE, LONGITUDE)
         index = get_next_hour_index(data.get("hourly", {}).get("time", []))
@@ -312,6 +320,13 @@ def check_home_alert(bot_token, chat_id):
         )
         return
 
+    if state.get("last_home_alert_time") == forecast_point["time"]:
+        logger.info(
+            "Already alerted for forecast slot %s, skipping duplicate.",
+            forecast_point["time"],
+        )
+        return
+
     logger.info(
         "Rain condition triggered! (probability=%s%%, total_rain=%.2f mm). Sending alert...",
         probability, total_rain,
@@ -321,15 +336,14 @@ def check_home_alert(bot_token, chat_id):
 
     try:
         send_telegram_message(bot_token, chat_id, message)
+        state["last_home_alert_time"] = forecast_point["time"]
     except requests.RequestException as exc:
         logger.error("Failed to send Telegram alert: %s", exc)
 
 
-def process_location_queries(bot_token, allowed_chat_id):
+def process_location_queries(bot_token, allowed_chat_id, state):
     """Check for new Telegram messages containing a Google Maps link (or a
     shared location) and reply with the rain forecast for that spot."""
-    state = load_state()
-
     try:
         updates = get_telegram_updates(bot_token, offset=state.get("last_update_id"))
     except requests.RequestException as exc:
@@ -400,7 +414,7 @@ def process_location_queries(bot_token, allowed_chat_id):
             except requests.RequestException:
                 pass
 
-    save_state({"last_update_id": highest_update_id})
+    state["last_update_id"] = highest_update_id
 
 
 def main():
@@ -414,8 +428,10 @@ def main():
         )
         sys.exit(1)
 
-    check_home_alert(bot_token, chat_id)
-    process_location_queries(bot_token, chat_id)
+    state = load_state()
+    check_home_alert(bot_token, chat_id, state)
+    process_location_queries(bot_token, chat_id, state)
+    save_state(state)
 
     logger.info("Done.")
 
