@@ -13,7 +13,9 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -21,7 +23,9 @@ import requests
 LATITUDE = 13.8628558
 LONGITUDE = 100.4303806
 TIMEZONE = "Asia/Bangkok"
-FORECAST_INDEX = 1  # 1 hour ahead in the hourly array
+BANGKOK_TZ = ZoneInfo(TIMEZONE)
+HOME_LABEL = "บ้าน นนทบุรี"
+HOME_COORD_TOLERANCE = 0.001  # ~110m, for matching a shared pin to home
 
 RAIN_PROBABILITY_THRESHOLD = 50  # percent
 RAIN_AMOUNT_THRESHOLD = 0.1  # mm
@@ -63,6 +67,26 @@ def fetch_forecast(lat, lon):
     return data
 
 
+def get_next_hour_index(times):
+    """Find the hourly array index matching exactly 1 hour from now (Bangkok time)."""
+    target = (datetime.now(BANGKOK_TZ) + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    target_str = target.strftime("%Y-%m-%dT%H:%M")
+    if target_str in times:
+        return times.index(target_str)
+    return min(1, len(times) - 1)
+
+
+def format_display_time(time_str):
+    """Format an Open-Meteo hourly timestamp as 24h Bangkok-local text."""
+    dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M")
+    return dt.strftime("%d/%m/%Y %H:%M น. (UTC+7)")
+
+
+def is_home_location(lat, lon):
+    """Check whether coordinates are close enough to count as the home location."""
+    return abs(lat - LATITUDE) <= HOME_COORD_TOLERANCE and abs(lon - LONGITUDE) <= HOME_COORD_TOLERANCE
+
+
 def extract_forecast_point(data, index):
     """Extract a single hourly forecast point at the given index."""
     hourly = data.get("hourly", {})
@@ -100,8 +124,8 @@ def build_alert_message(lat, lon, forecast_point, total_rain):
     """Build a nicely formatted Markdown message for the scheduled home alert."""
     return (
         "🌧️ *แจ้งเตือนฝนตก* 🌧️\n\n"
-        f"📍 *พิกัด:* `{lat}, {lon}`\n"
-        f"🕐 *ช่วงเวลา:* `{forecast_point['time']}`\n\n"
+        f"📍 *พิกัด:* `{lat}, {lon}` ({HOME_LABEL})\n"
+        f"🕐 *ช่วงเวลา:* {format_display_time(forecast_point['time'])}\n\n"
         f"☔️ *โอกาสเกิดฝน:* `{forecast_point['precipitation_probability']}%`\n"
         f"💧 *ปริมาณฝน:* `{forecast_point['precipitation']} มม.`\n"
         f"🌦️ *Showers:* `{forecast_point['showers']} มม.`\n"
@@ -115,12 +139,13 @@ def build_query_reply_message(lat, lon, forecast_point, total_rain, triggered):
     status_emoji = "🌧️" if triggered else "🌤️"
     status_text = "*มีแนวโน้มฝนตกในชั่วโมงหน้า!*" if triggered else "ไม่มีแนวโน้มฝนตกในชั่วโมงหน้า"
     maps_link = f"https://www.google.com/maps?q={lat},{lon}"
+    home_suffix = f" ({HOME_LABEL})" if is_home_location(lat, lon) else ""
 
     return (
         f"{status_emoji} *ผลการเช็คพยากรณ์ฝน*\n\n"
-        f"📍 *พิกัด:* `{lat}, {lon}`\n"
+        f"📍 *พิกัด:* `{lat}, {lon}`{home_suffix}\n"
         f"🔗 [เปิดใน Google Maps]({maps_link})\n"
-        f"🕐 *ช่วงเวลา:* `{forecast_point['time']}`\n\n"
+        f"🕐 *ช่วงเวลา:* {format_display_time(forecast_point['time'])}\n\n"
         f"☔️ *โอกาสเกิดฝน:* `{forecast_point['precipitation_probability']}%`\n"
         f"💧 *ปริมาณฝน:* `{forecast_point['precipitation']} มม.`\n"
         f"🌦️ *Showers:* `{forecast_point['showers']} มม.`\n"
@@ -241,7 +266,8 @@ def check_home_alert(bot_token, chat_id):
     """Check the home location and send an alert if rain is likely soon."""
     try:
         data = fetch_forecast(LATITUDE, LONGITUDE)
-        forecast_point = extract_forecast_point(data, FORECAST_INDEX)
+        index = get_next_hour_index(data.get("hourly", {}).get("time", []))
+        forecast_point = extract_forecast_point(data, index)
     except (requests.RequestException, IndexError, KeyError) as exc:
         logger.error("Failed to fetch or parse forecast data: %s", exc)
         return
@@ -320,7 +346,8 @@ def process_location_queries(bot_token, allowed_chat_id):
 
         try:
             data = fetch_forecast(lat, lon)
-            forecast_point = extract_forecast_point(data, FORECAST_INDEX)
+            index = get_next_hour_index(data.get("hourly", {}).get("time", []))
+            forecast_point = extract_forecast_point(data, index)
             triggered, _, total_rain = should_alert(forecast_point)
             reply = build_query_reply_message(lat, lon, forecast_point, total_rain, triggered)
             send_telegram_message(bot_token, chat_id, reply)
