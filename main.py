@@ -38,6 +38,8 @@ GOOGLE_MAPS_HOSTS = ("google.com", "maps.google.com", "goo.gl", "maps.app.goo.gl
 URL_PATTERN = re.compile(r"https?://\S+")
 LATLON_AT_PATTERN = re.compile(r"@(-?\d+\.\d+),(-?\d+\.\d+)")
 LATLON_VALUE_PATTERN = re.compile(r"^(-?\d+\.\d+),\s*(-?\d+\.\d+)")
+LATLON_3D4D_PATTERN = re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)")
+PLACE_CID_PATTERN = re.compile(r"!1s0x[0-9a-f]+:(0x[0-9a-f]+)")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "state.json")
 
@@ -227,6 +229,10 @@ def extract_latlon_from_maps_url(url):
     if match:
         return float(match.group(1)), float(match.group(2))
 
+    match = LATLON_3D4D_PATTERN.search(url)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+
     query_params = parse_qs(parsed.query)
     for key in ("q", "query", "ll", "destination"):
         for value in query_params.get(key, []):
@@ -339,6 +345,22 @@ def process_location_queries(bot_token, allowed_chat_id):
             coords = None
 
         if not coords:
+            maps_url = find_google_maps_url(message.get("text") or message.get("caption"))
+            if not maps_url:
+                continue
+
+            logger.info("Found a Google Maps link but could not extract coordinates: %s", maps_url)
+            try:
+                send_telegram_message(
+                    bot_token, chat_id,
+                    "⚠️ ขออภัยครับ ไม่สามารถแกะพิกัดจากลิงก์นี้ได้ "
+                    "(ลิงก์ประเภทนี้ไม่มีพิกัดฝังอยู่โดยตรง มักเกิดกับลิงก์แชร์ร้าน/สถานที่จากแอปมือถือ)\n\n"
+                    "ลองวิธีนี้แทนครับ:\n"
+                    "• กดค้างบนตำแหน่งในแผนที่เพื่อปักหมุดเอง แล้วกด Share จะได้ลิงก์ที่มีพิกัดฝังอยู่\n"
+                    "• หรือกด 📎 ใน Telegram แล้วเลือก Location เพื่อแชร์พิกัดโดยตรง (แม่นยำสุด)",
+                )
+            except requests.RequestException:
+                pass
             continue
 
         lat, lon = coords
