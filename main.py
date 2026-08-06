@@ -40,6 +40,7 @@ LATLON_AT_PATTERN = re.compile(r"@(-?\d+\.\d+),(-?\d+\.\d+)")
 LATLON_VALUE_PATTERN = re.compile(r"^(-?\d+\.\d+),\s*(-?\d+\.\d+)")
 LATLON_3D4D_PATTERN = re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)")
 PLACE_CID_PATTERN = re.compile(r"!1s0x[0-9a-f]+:(0x[0-9a-f]+)")
+PLAIN_LATLON_PATTERN = re.compile(r"(-?\d{1,2}\.\d{1,10})\s*,\s*(-?\d{1,3}\.\d{1,10})")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "state.json")
 
@@ -253,19 +254,35 @@ def find_google_maps_url(text):
     return None
 
 
+def extract_plain_latlon(text):
+    """Find a bare 'lat, lon' pair typed or pasted directly into the message
+    (e.g. copied from a Google Maps pin: 13.7605620, 100.5680219)."""
+    if not text:
+        return None
+    for lat_str, lon_str in PLAIN_LATLON_PATTERN.findall(text):
+        lat, lon = float(lat_str), float(lon_str)
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    return None
+
+
 def extract_query_location(message):
-    """Extract (lat, lon) from a Telegram message: a Google Maps link or a
-    natively shared location. Returns None if nothing usable was found."""
+    """Extract (lat, lon) from a Telegram message: a Google Maps link, a
+    natively shared location, or a bare 'lat, lon' pair. Returns None if
+    nothing usable was found."""
     location = message.get("location")
     if location:
         return location["latitude"], location["longitude"]
 
     text = message.get("text") or message.get("caption")
-    maps_url = find_google_maps_url(text)
-    if not maps_url:
-        return None
 
-    return extract_latlon_from_maps_url(maps_url)
+    maps_url = find_google_maps_url(text)
+    if maps_url:
+        coords = extract_latlon_from_maps_url(maps_url)
+        if coords:
+            return coords
+
+    return extract_plain_latlon(text)
 
 
 def check_home_alert(bot_token, chat_id):
