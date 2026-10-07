@@ -18,6 +18,7 @@ eye against landmarks, so ETAs are approximate (a few km / minutes).
 import io
 import logging
 import math
+from datetime import datetime, timezone
 
 import numpy as np
 import requests
@@ -55,6 +56,175 @@ MOTION_BLUR_PX = 6  # Gaussian sigma applied before correlating
 MOTION_MIN_ECHO_PX = 150  # need this many echo pixels in both frames to trust motion
 MOTION_MAX_KMH = 100
 LEAD_MAX_MIN = 60  # how far ahead to extrapolate
+
+
+# Frame timestamp, drawn bottom-right as "YYYY-MM-DD HH:MM:SS" in UTC. Digits
+# sit at fixed x offsets and are read by matching against DIGIT_GLYPHS
+# (binary bitmaps learned from real frames, see GLYPH_* for tolerances).
+STAMP_ROWS = (1569, 1584)
+STAMP_X0 = 1746
+STAMP_DIGIT_X = (17, 25, 34, 42, 58, 66, 78, 86, 101, 108, 122, 130, 143, 151)  # YYYYMMDDHHMMSS
+STAMP_WHITE = 200  # text is white; all channels above this
+GLYPH_WIDTH = 9
+GLYPH_SEARCH_PX = 3  # glyphs are anti-aliased at sub-pixel offsets
+GLYPH_MAX_ERROR = 32  # mismatched pixels (of 15x9) beyond which a digit is unreadable
+GLYPH_MIN_MARGIN = 4  # best match must beat the runner-up by this many pixels
+
+DIGIT_GLYPHS = {
+    "0": (
+        ".........",
+        "..##.....",
+        ".#####...",
+        "###.###..",
+        "##...##..",
+        "##...##..",
+        "##...##..",
+        "##...##..",
+        "##...##..",
+        "##...##..",
+        "##...##..",
+        "###.###..",
+        ".#####...",
+        "...#.....",
+        ".........",
+    ),
+    "1": (
+        ".........",
+        ".........",
+        "###.....#",
+        "###....##",
+        ".##....##",
+        ".##....##",
+        ".##....##",
+        ".##...###",
+        ".##....#.",
+        ".##....##",
+        ".##....##",
+        ".##....##",
+        ".##.....#",
+        ".........",
+        ".........",
+    ),
+    "2": (
+        ".........",
+        "..##.....",
+        "######...",
+        "##..###..",
+        "#....##..",
+        ".....##..",
+        "....###..",
+        "...###...",
+        "...##....",
+        "..##.....",
+        ".##......",
+        "#######..",
+        "########.",
+        ".........",
+        ".........",
+    ),
+    "3": (
+        ".........",
+        ".##......",
+        "#####....",
+        "#..###..#",
+        "#...##..#",
+        "....##..#",
+        ".####..##",
+        ".####..##",
+        "...###..#",
+        "....##..#",
+        "#...##..#",
+        "#..###..#",
+        "#####....",
+        ".........",
+        ".........",
+    ),
+    "4": (
+        ".........",
+        ".........",
+        "...##....",
+        "..###....",
+        ".####...#",
+        ".####...#",
+        "##.##...#",
+        "##.##...#",
+        "#..##....",
+        "#######..",
+        "#######.#",
+        "...##...#",
+        "...##....",
+        ".........",
+        ".........",
+    ),
+    "5": (
+        ".........",
+        ".###.#...",
+        ".######..",
+        ".#####...",
+        "###......",
+        "#####....",
+        "######...",
+        "###.###..",
+        ".....##..",
+        ".....##..",
+        "##...##..",
+        "###.###..",
+        ".#####...",
+        ".........",
+        ".........",
+    ),
+    "6": (
+        ".........",
+        ".........",
+        "...####..",
+        "..####...",
+        ".###.....",
+        ".##.##...",
+        ".######..",
+        ".###.###.",
+        ".##...##.",
+        ".##...##.",
+        ".##...##.",
+        ".###.###.",
+        "..#####..",
+        ".........",
+        ".........",
+    ),
+    "7": (
+        ".........",
+        "....##...",
+        "########.",
+        "......##.",
+        "......##.",
+        ".....##..",
+        ".....##..",
+        "....##...",
+        "....##...",
+        "...##....",
+        "...##....",
+        "..###....",
+        "..##.....",
+        ".........",
+        ".........",
+    ),
+    "8": (
+        ".........",
+        "..##.....",
+        ".#####...",
+        "###.###..",
+        "##...##..",
+        "##...##..",
+        "######...",
+        ".#####...",
+        "##..###..",
+        "##...##..",
+        "##...##..",
+        "###.###..",
+        ".#####...",
+        ".........",
+        ".........",
+    ),
+}
 
 
 def dbz_to_rain_rate(dbz):
@@ -179,22 +349,55 @@ def _bearing_text(dx, dy):
     return names[int((bearing + 22.5) // 45) % 8]
 
 
+def _read_digit(text, x):
+    """Best-matching digit for the glyph at column x, or None if unsure."""
+    scores = []
+    for digit, glyph in _GLYPH_ARRAYS.items():
+        best = min(
+            int((text[:, x + dx:x + dx + GLYPH_WIDTH] ^ glyph).sum())
+            for dx in range(-GLYPH_SEARCH_PX, GLYPH_SEARCH_PX + 1)
+        )
+        scores.append((best, digit))
+    scores.sort()
+    if scores[0][0] > GLYPH_MAX_ERROR or scores[1][0] - scores[0][0] < GLYPH_MIN_MARGIN:
+        return None
+    return scores[0][1]
+
+
+def read_frame_time(frame):
+    """UTC timestamp printed on a frame, or None if it can't be read reliably."""
+    try:
+        text = frame[STAMP_ROWS[0]:STAMP_ROWS[1], STAMP_X0 - GLYPH_SEARCH_PX:].astype(int).min(axis=2) > STAMP_WHITE
+        digits = [_read_digit(text, x + GLYPH_SEARCH_PX) for x in STAMP_DIGIT_X]
+        if None in digits:
+            return None
+        return datetime.strptime("".join(digits), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except (ValueError, IndexError):
+        return None
+
+
 def prepare_radar(frames):
-    """dBZ fields of the last two frames (the only ones the nowcast needs)."""
+    """dBZ fields of the last two frames (the only ones the nowcast needs),
+    plus the latest frame's UTC time (None if unreadable)."""
     palette = build_palette(frames[-1])
     return {
         "prev": dbz_field(frames[-2], palette) if len(frames) >= 2 else None,
         "curr": dbz_field(frames[-1], palette),
+        "time": read_frame_time(frames[-1]),
     }
 
 
-def analyze_radar(prepared, lat, lon):
+def analyze_radar(prepared, lat, lon, age_min=0):
     """Radar nowcast for a point, from prepare_radar() output.
 
+    `age_min` is how old the latest frame is; echoes are extrapolated forward
+    by that much so "now" and the ETA are relative to the real current time,
+    not the frame time.
+
     Returns None if the point is outside radar coverage, else a dict:
-      now_dbz, motion_kmh / from_direction (or None), eta_min (None if no rain
-      expected within LEAD_MAX_MIN), peak_dbz (echo that will reach the point),
-      triggered.
+      now_dbz, motion_kmh / from_direction (or None), eta_min (minutes from now,
+      None if no rain expected within LEAD_MAX_MIN), peak_dbz (echo that will
+      reach the point), triggered.
     """
     point = latlon_to_px(lat, lon)
     dist_km = math.hypot(point[0] - CENTER_PX[0], point[1] - CENTER_PX[1]) * KM_PER_PX
@@ -202,28 +405,34 @@ def analyze_radar(prepared, lat, lon):
         return None
 
     curr = prepared["curr"]
-    now_dbz = max_dbz_near(curr, point, TARGET_RADIUS_KM)
-
     motion = None
     if prepared["prev"] is not None:
         motion = estimate_motion(prepared["prev"], curr, point)
 
+    def dbz_arriving_after(minutes):
+        """Echo reaching the point `minutes` after the frame time."""
+        if motion is None:
+            return max_dbz_near(curr, point, TARGET_RADIUS_KM)
+        frac = minutes / FRAME_INTERVAL_MIN
+        upwind = (point[0] - motion[0] * frac, point[1] - motion[1] * frac)
+        return max_dbz_near(curr, upwind, TARGET_RADIUS_KM)
+
+    age_min = max(age_min, 0)
+    now_dbz = dbz_arriving_after(age_min)
     eta_min, peak_dbz = None, 0.0
     if now_dbz >= RADAR_DBZ_THRESHOLD:
         eta_min, peak_dbz = 0, now_dbz
     elif motion is not None:
         # Walk upwind in steps no longer than the search radius so fast-moving
         # cells can't slip between samples.
-        intervals = LEAD_MAX_MIN / FRAME_INTERVAL_MIN
-        path_px = math.hypot(*motion) * intervals
+        path_px = math.hypot(*motion) * LEAD_MAX_MIN / FRAME_INTERVAL_MIN
         radius_px = TARGET_RADIUS_KM / KM_PER_PX
         steps = max(6, math.ceil(path_px / radius_px))
         for i in range(1, steps + 1):
-            frac = intervals * i / steps
-            upwind = (point[0] - motion[0] * frac, point[1] - motion[1] * frac)
-            dbz = max_dbz_near(curr, upwind, TARGET_RADIUS_KM)
+            lead = LEAD_MAX_MIN * i / steps
+            dbz = dbz_arriving_after(age_min + lead)
             if dbz >= RADAR_DBZ_THRESHOLD:
-                eta_min = max(5, int(round(frac * FRAME_INTERVAL_MIN / 5)) * 5)
+                eta_min = max(5, int(round(lead / 5)) * 5)
                 peak_dbz = dbz
                 break
 
@@ -266,3 +475,9 @@ def fetch_radar():
     except Exception as exc:  # noqa: BLE001 - radar is optional; log and carry on
         logger.warning("Could not fetch/decode radar loop: %s", exc)
         return None
+
+
+_GLYPH_ARRAYS = {
+    digit: np.array([[ch == "#" for ch in row] for row in rows])
+    for digit, rows in DIGIT_GLYPHS.items()
+}

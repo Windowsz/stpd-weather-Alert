@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -39,6 +39,7 @@ MIN_MODEL_VOTES = 2
 WINDOW_HOURS = 3  # hourly slots looked at, starting with the current hour
 ALERT_COOLDOWN_HOURS = 2  # don't re-alert on the models for the same rain spell
 RADAR_ALERT_COOLDOWN_MIN = 60  # radar alerts have their own, shorter cooldown
+RADAR_MAX_AGE_MIN = 50  # ignore the radar if its latest frame is older (TMD normally lags 10-35 min)
 RAIN_PROBABILITY_THRESHOLD = 40  # percent
 RAIN_AMOUNT_THRESHOLD = 0.5  # mm per hour
 
@@ -176,25 +177,52 @@ def get_radar():
 
 
 def radar_nowcast(lat, lon):
-    """(result, available) for a point. Never raises: radar is a bonus signal
-    and must not break the run (and with it, saving the Telegram offset)."""
+    """Radar nowcast for a point -> (result, text, fetched).
+
+    `result` is None when there's nothing usable (download/analysis failed,
+    the latest frame is too old, or the point is out of range); `text` is the
+    Telegram line to show either way; `fetched` says whether the loop was
+    downloaded. Never raises: radar is a bonus signal and must not break the run
+    (and with it, saving the Telegram offset)."""
     prepared = get_radar()
     if prepared is None:
-        return None, False
+        return None, "🛰️ *เรดาร์ TMD:* ดึงข้อมูลไม่สำเร็จ", False
+
+    frame_time = prepared.get("time")
+    age_min = 0
+    if frame_time is None:
+        logger.warning("Could not read the radar frame time; assuming it is current.")
+    else:
+        age_min = (datetime.now(timezone.utc) - frame_time).total_seconds() / 60
+        if age_min < -10:  # a frame from the future means the timestamp was misread
+            logger.warning("Radar frame time %s is in the future; ignoring it.", frame_time)
+            frame_time, age_min = None, 0
+        elif age_min > RADAR_MAX_AGE_MIN:
+            logger.warning("Radar frame is %.0f min old; not using it.", age_min)
+            return None, (
+                f"🛰️ *เรดาร์ TMD:* ภาพล่าสุดเก่าเกินไป ({_bangkok_hhmm(frame_time)}) "
+                "จึงไม่ใช้ข้อมูลเรดาร์รอบนี้"
+            ), True
+
     try:
-        return radar.analyze_radar(prepared, lat, lon), True
+        result = radar.analyze_radar(prepared, lat, lon, age_min)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Radar analysis failed: %s", exc)
-        return None, False
+        return None, "🛰️ *เรดาร์ TMD:* วิเคราะห์ข้อมูลไม่สำเร็จ", False
+    return result, radar_line(result, frame_time), True
 
 
-def radar_line(radar_result, available=True):
-    """One Telegram line describing the radar nowcast ('' if nothing to say)."""
-    if not available:
-        return "🛰️ *เรดาร์ TMD:* ดึงข้อมูลไม่สำเร็จ"
+def _bangkok_hhmm(utc_time):
+    """'01:15 น.' style Bangkok time for a UTC datetime."""
+    return utc_time.astimezone(BANGKOK_TZ).strftime("%H:%M น.")
+
+
+def radar_line(radar_result, frame_time=None):
+    """One Telegram line describing the radar nowcast."""
     if radar_result is None:
         return "🛰️ *เรดาร์ TMD:* พิกัดนี้อยู่นอกรัศมีเรดาร์สุวรรณภูมิ"
 
+    label = f"🛰️ *เรดาร์ TMD* (ภาพ {_bangkok_hhmm(frame_time)}):" if frame_time else "🛰️ *เรดาร์ TMD:*"
     motion = ""
     if radar_result["from_direction"]:
         motion = (
@@ -204,15 +232,15 @@ def radar_line(radar_result, available=True):
     if radar_result["eta_min"] == 0:
         rate = radar.dbz_to_rain_rate(radar_result["now_dbz"])
         return (
-            f"🛰️ *เรดาร์ TMD:* ตรวจพบฝนเหนือพื้นที่ตอนนี้ "
+            f"{label} น่าจะมีฝนเหนือพื้นที่ตอนนี้ "
             f"(`{radar_result['now_dbz']:.0f} dBZ` ≈ {rate:.1f} มม./ชม.){motion}"
         )
     if radar_result["eta_min"] is not None:
         return (
-            f"🛰️ *เรดาร์ TMD:* คาดว่าฝนจะถึงใน ~{radar_result['eta_min']} นาที "
+            f"{label} คาดว่าฝนจะถึงใน ~{radar_result['eta_min']} นาที "
             f"(`{radar_result['peak_dbz']:.0f} dBZ`){motion}"
         )
-    return f"🛰️ *เรดาร์ TMD:* ยังไม่พบฝนใกล้พื้นที่ใน 1 ชั่วโมงข้างหน้า{motion}"
+    return f"{label} ยังไม่พบฝนใกล้พื้นที่ใน 1 ชั่วโมงข้างหน้า{motion}"
 
 
 def _model_lines(analysis):
@@ -458,9 +486,8 @@ def check_home_alert(bot_token, chat_id, state):
     if size is not None and size == state.get("radar_size"):
         logger.info("Radar loop unchanged since last run, skipping radar check.")
     else:
-        radar_result, available = radar_nowcast(LATITUDE, LONGITUDE)
-        radar_text = radar_line(radar_result, available)
-        if available:
+        radar_result, radar_text, fetched = radar_nowcast(LATITUDE, LONGITUDE)
+        if fetched:
             new_radar_size = size
             logger.info("Radar nowcast: %s", radar_result)
 
@@ -561,13 +588,13 @@ def process_location_queries(bot_token, allowed_chat_id, state):
         logger.info("Location query received: lat=%s, lon=%s", lat, lon)
 
         analysis = fetch_forecast_analysis(lat, lon)
-        radar_result, radar_available = radar_nowcast(lat, lon)
+        radar_result, radar_text, _ = radar_nowcast(lat, lon)
         try:
             if analysis is None and radar_result is None:
                 raise ValueError("neither forecast nor radar data available")
             reply = build_query_reply_message(
                 lat, lon, analysis,
-                radar_text=radar_line(radar_result, radar_available),
+                radar_text=radar_text,
                 radar_triggered=bool(radar_result and radar_result["triggered"]),
             )
             send_telegram_message(bot_token, chat_id, reply)
