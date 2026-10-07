@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Rain Alert - checks Open-Meteo forecasts and sends Telegram alerts.
+"""Rain Alert - checks Open-Meteo forecasts and the TMD rain radar and sends
+Telegram alerts.
 
 Two features:
-1. Scheduled home-location check: alerts if rain is likely in the next hour.
+1. Scheduled home-location check: alerts if enough forecast models expect
+   rain in the next few hours, or the radar shows rain over / approaching home.
 2. On-demand query: if the user sends a Google Maps link (or shares a
    location) in the Telegram chat, the bot replies with the rain forecast
    for that spot.
@@ -34,8 +36,9 @@ HOME_COORD_TOLERANCE = 0.001  # ~110m, for matching a shared pin to home
 # RAIN_PROBABILITY_THRESHOLD. An alert needs MIN_MODEL_VOTES models to agree.
 FORECAST_MODELS = ("ecmwf_ifs025", "icon_global", "gfs_global")
 MIN_MODEL_VOTES = 2
-WINDOW_HOURS = 3  # look-ahead window, starting 1 hour from now
-ALERT_COOLDOWN_HOURS = 2  # don't re-alert for the same rain spell
+WINDOW_HOURS = 3  # hourly slots looked at, starting with the current hour
+ALERT_COOLDOWN_HOURS = 2  # don't re-alert on the models for the same rain spell
+RADAR_ALERT_COOLDOWN_MIN = 60  # radar alerts have their own, shorter cooldown
 RAIN_PROBABILITY_THRESHOLD = 40  # percent
 RAIN_AMOUNT_THRESHOLD = 0.5  # mm per hour
 
@@ -81,8 +84,10 @@ def fetch_forecast(lat, lon):
 
 
 def get_window_start_index(times):
-    """Index of the first hourly slot of the look-ahead window (1 hour from now,
-    Bangkok time). Raises IndexError if the data doesn't cover it."""
+    """Index of the first hourly slot of the look-ahead window. Open-Meteo's
+    hourly precipitation at time T is the total for the hour *before* T, so the
+    slot stamped (current hour + 1) covers the current hour. Raises IndexError
+    if the data doesn't cover it."""
     target = (datetime.now(BANGKOK_TZ) + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
     target_str = target.strftime("%Y-%m-%dT%H:%M")
     if target_str not in times:
@@ -103,7 +108,7 @@ def is_home_location(lat, lon):
 
 def _series(hourly, name, model):
     """Hourly list for a variable/model; Open-Meteo suffixes keys with the model name."""
-    return hourly.get(f"{name}_{model}") or hourly.get(name) or []
+    return hourly.get(f"{name}_{model}") or []
 
 
 def analyze_forecast(data, start_index, window_hours=WINDOW_HOURS):
@@ -159,15 +164,28 @@ def analyze_forecast(data, start_index, window_hours=WINDOW_HOURS):
     }
 
 
-_radar_cache = {"loaded": False, "frames": None}
+_radar_cache = {"loaded": False, "prepared": None}
 
 
-def get_radar_frames():
-    """Download the TMD radar loop at most once per run (None if unavailable)."""
+def get_radar():
+    """Download and prepare the TMD radar loop at most once per run (None if unavailable)."""
     if not _radar_cache["loaded"]:
-        _radar_cache["frames"] = radar.fetch_radar_frames()
+        _radar_cache["prepared"] = radar.fetch_radar()
         _radar_cache["loaded"] = True
-    return _radar_cache["frames"]
+    return _radar_cache["prepared"]
+
+
+def radar_nowcast(lat, lon):
+    """(result, available) for a point. Never raises: radar is a bonus signal
+    and must not break the run (and with it, saving the Telegram offset)."""
+    prepared = get_radar()
+    if prepared is None:
+        return None, False
+    try:
+        return radar.analyze_radar(prepared, lat, lon), True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Radar analysis failed: %s", exc)
+        return None, False
 
 
 def radar_line(radar_result, available=True):
@@ -208,9 +226,22 @@ def _model_lines(analysis):
 
 
 def _window_text(analysis):
-    start = format_display_time(analysis["window_start"])
+    fmt = "%Y-%m-%dT%H:%M"
+    period_start = datetime.strptime(analysis["window_start"], fmt) - timedelta(hours=1)
+    start = format_display_time(period_start.strftime(fmt))
     end = datetime.strptime(analysis["window_end"], "%Y-%m-%dT%H:%M").strftime("%H:%M น.")
     return f"{start} – {end}"
+
+
+def _forecast_section(analysis):
+    """Time window + model votes, or a note that the forecast is unavailable."""
+    if analysis is None:
+        return "⚠️ ดึงพยากรณ์จากโมเดลไม่สำเร็จ (ใช้ข้อมูลเรดาร์อย่างเดียว)\n\n"
+    return (
+        f"🕐 *ช่วงเวลา:* {_window_text(analysis)}\n\n"
+        f"🗳️ *โมเดลที่เห็นตรงกันว่าฝนตก:* {analysis['votes']}/{analysis['model_count']}\n"
+        f"{_model_lines(analysis)}\n\n"
+    )
 
 
 def build_alert_message(lat, lon, analysis, radar_text=""):
@@ -218,9 +249,7 @@ def build_alert_message(lat, lon, analysis, radar_text=""):
     return (
         "🌧️ *แจ้งเตือนฝนตก* 🌧️\n\n"
         f"📍 *พิกัด:* `{lat}, {lon}` ({HOME_LABEL})\n"
-        f"🕐 *ช่วงเวลา:* {_window_text(analysis)}\n\n"
-        f"🗳️ *โมเดลที่เห็นตรงกันว่าฝนตก:* {analysis['votes']}/{analysis['model_count']}\n"
-        f"{_model_lines(analysis)}\n\n"
+        + _forecast_section(analysis)
         + (f"{radar_text}\n\n" if radar_text else "")
         + "_แนะนำให้เตรียมร่มหรือเสื้อกันฝนไว้ล่วงหน้า_"
     )
@@ -228,7 +257,7 @@ def build_alert_message(lat, lon, analysis, radar_text=""):
 
 def build_query_reply_message(lat, lon, analysis, radar_text="", radar_triggered=False):
     """Build a Markdown reply for an on-demand location query."""
-    triggered = analysis["triggered"] or radar_triggered
+    triggered = bool(analysis and analysis["triggered"]) or radar_triggered
     status_emoji = "🌧️" if triggered else "🌤️"
     status_text = (
         f"*มีแนวโน้มฝนตกใน {WINDOW_HOURS} ชั่วโมงข้างหน้า!*"
@@ -241,9 +270,7 @@ def build_query_reply_message(lat, lon, analysis, radar_text="", radar_triggered
         f"{status_emoji} *ผลการเช็คพยากรณ์ฝน*\n\n"
         f"📍 *พิกัด:* `{lat}, {lon}`{home_suffix}\n"
         f"🔗 [เปิดใน Google Maps]({maps_link})\n"
-        f"🕐 *ช่วงเวลา:* {_window_text(analysis)}\n\n"
-        f"🗳️ *โมเดลที่เห็นตรงกันว่าฝนตก:* {analysis['votes']}/{analysis['model_count']}\n"
-        f"{_model_lines(analysis)}\n\n"
+        + _forecast_section(analysis)
         + (f"{radar_text}\n\n" if radar_text else "")
         + f"{status_text}"
     )
@@ -288,10 +315,16 @@ def load_state():
                 state.setdefault("last_update_id", None)
                 state.setdefault("last_home_alert_time", None)
                 state.setdefault("radar_size", None)
+                state.setdefault("last_radar_alert_time", None)
                 return state
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read state file, starting fresh: %s", exc)
-    return {"last_update_id": None, "last_home_alert_time": None, "radar_size": None}
+    return {
+        "last_update_id": None,
+        "last_home_alert_time": None,
+        "radar_size": None,
+        "last_radar_alert_time": None,
+    }
 
 
 def save_state(state):
@@ -382,78 +415,93 @@ def extract_query_location(message):
     return extract_plain_latlon(text)
 
 
-def is_in_cooldown(last_alert_slot, window_start):
-    """True if the last alert was recent enough that this window is the same rain spell."""
-    if not last_alert_slot:
+def is_in_cooldown(last_alert, current, cooldown):
+    """True if `last_alert` (a "%Y-%m-%dT%H:%M" stamp) is less than `cooldown`
+    (a timedelta) before `current`."""
+    if not last_alert:
         return False
     fmt = "%Y-%m-%dT%H:%M"
-    elapsed = datetime.strptime(window_start, fmt) - datetime.strptime(last_alert_slot, fmt)
-    return elapsed < timedelta(hours=ALERT_COOLDOWN_HOURS)
+    return datetime.strptime(current, fmt) - datetime.strptime(last_alert, fmt) < cooldown
+
+
+def fetch_forecast_analysis(lat, lon):
+    """Model-vote analysis for a point, or None if the forecast is unavailable."""
+    try:
+        data = fetch_forecast(lat, lon)
+        index = get_window_start_index(data.get("hourly", {}).get("time", []))
+        return analyze_forecast(data, index)
+    except (requests.RequestException, ValueError, IndexError, KeyError) as exc:
+        logger.error("Failed to fetch or parse forecast data: %s", exc)
+        return None
 
 
 def check_home_alert(bot_token, chat_id, state):
     """Check the home location and send an alert if enough models expect rain
-    in the next few hours.
+    in the next few hours, or the radar shows rain over / approaching home.
 
-    Alerts are spaced at least ALERT_COOLDOWN_HOURS apart (tracked in `state`),
-    so running this frequently doesn't spam repeats for the same rain spell."""
-    try:
-        data = fetch_forecast(LATITUDE, LONGITUDE)
-        index = get_window_start_index(data.get("hourly", {}).get("time", []))
-        analysis = analyze_forecast(data, index)
-    except (requests.RequestException, IndexError, KeyError) as exc:
-        logger.error("Failed to fetch or parse forecast data: %s", exc)
-        return
-
-    for name, m in analysis["models"].items():
-        logger.info(
-            "Model %s -> peak_rain=%.2f mm, peak_prob=%s, votes_rain=%s",
-            name, m["peak_rain"], m["peak_prob"], m["votes_rain"],
-        )
+    Model alerts are spaced ALERT_COOLDOWN_HOURS apart and radar alerts
+    RADAR_ALERT_COOLDOWN_MIN apart (tracked separately in `state`), so a model
+    alert never silences a later "rain arriving in N minutes" radar alert, and
+    running frequently doesn't spam repeats."""
+    analysis = fetch_forecast_analysis(LATITUDE, LONGITUDE)
+    if analysis:
+        for name, m in analysis["models"].items():
+            logger.info(
+                "Model %s -> peak_rain=%.2f mm, peak_prob=%s, votes_rain=%s",
+                name, m["peak_rain"], m["peak_prob"], m["votes_rain"],
+            )
 
     # Radar (nowcast) check. The GIF has no cache headers, but its size changes
     # whenever a new frame is added, so an unchanged size means nothing new.
-    radar_result, radar_text = None, ""
+    radar_result, radar_text, new_radar_size = None, "", None
     size = radar.fetch_radar_size()
     if size is not None and size == state.get("radar_size"):
         logger.info("Radar loop unchanged since last run, skipping radar check.")
     else:
-        frames = get_radar_frames()
-        if frames:
-            radar_result = radar.analyze_radar(frames, LATITUDE, LONGITUDE)
-            radar_text = radar_line(radar_result)
-            state["radar_size"] = size
+        radar_result, available = radar_nowcast(LATITUDE, LONGITUDE)
+        radar_text = radar_line(radar_result, available)
+        if available:
+            new_radar_size = size
             logger.info("Radar nowcast: %s", radar_result)
-        else:
-            radar_text = radar_line(None, available=False)
 
+    now_slot = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%dT%H:%M")
+    model_triggered = bool(analysis and analysis["triggered"])
     radar_triggered = bool(radar_result and radar_result["triggered"])
-    if not (analysis["triggered"] or radar_triggered):
-        logger.info(
-            "No alert needed (%d/%d models vote rain, need %d; radar: no rain expected).",
-            analysis["votes"], analysis["model_count"], MIN_MODEL_VOTES,
-        )
-        return
-
-    if is_in_cooldown(state.get("last_home_alert_time"), analysis["window_start"]):
-        logger.info(
-            "Already alerted at %s (cooldown %dh), skipping duplicate.",
-            state.get("last_home_alert_time"), ALERT_COOLDOWN_HOURS,
-        )
-        return
-
-    logger.info(
-        "Rain condition triggered! (%d/%d models). Sending alert...",
-        analysis["votes"], analysis["model_count"],
+    model_due = model_triggered and not is_in_cooldown(
+        state.get("last_home_alert_time"), analysis["window_start"],
+        timedelta(hours=ALERT_COOLDOWN_HOURS),
+    )
+    radar_due = radar_triggered and not is_in_cooldown(
+        state.get("last_radar_alert_time"), now_slot,
+        timedelta(minutes=RADAR_ALERT_COOLDOWN_MIN),
     )
 
+    if not (model_due or radar_due):
+        if model_triggered or radar_triggered:
+            logger.info("Rain expected but already alerted recently (cooldown), skipping.")
+        else:
+            logger.info("No alert needed (models and radar don't expect rain).")
+        if new_radar_size is not None:
+            state["radar_size"] = new_radar_size
+        return
+
+    logger.info("Rain condition triggered (models=%s, radar=%s). Sending alert...",
+                model_triggered, radar_triggered)
     message = build_alert_message(LATITUDE, LONGITUDE, analysis, radar_text)
 
     try:
         send_telegram_message(bot_token, chat_id, message)
-        state["last_home_alert_time"] = analysis["window_start"]
     except requests.RequestException as exc:
+        # Leave radar_size unchanged so the next run re-checks the radar and retries.
         logger.error("Failed to send Telegram alert: %s", exc)
+        return
+
+    if model_triggered:
+        state["last_home_alert_time"] = analysis["window_start"]
+    if radar_triggered:
+        state["last_radar_alert_time"] = now_slot
+    if new_radar_size is not None:
+        state["radar_size"] = new_radar_size
 
 
 def process_location_queries(bot_token, allowed_chat_id, state):
@@ -512,19 +560,18 @@ def process_location_queries(bot_token, allowed_chat_id, state):
         lat, lon = coords
         logger.info("Location query received: lat=%s, lon=%s", lat, lon)
 
+        analysis = fetch_forecast_analysis(lat, lon)
+        radar_result, radar_available = radar_nowcast(lat, lon)
         try:
-            data = fetch_forecast(lat, lon)
-            index = get_window_start_index(data.get("hourly", {}).get("time", []))
-            analysis = analyze_forecast(data, index)
-            frames = get_radar_frames()
-            radar_result = radar.analyze_radar(frames, lat, lon) if frames else None
+            if analysis is None and radar_result is None:
+                raise ValueError("neither forecast nor radar data available")
             reply = build_query_reply_message(
                 lat, lon, analysis,
-                radar_text=radar_line(radar_result, available=bool(frames)),
+                radar_text=radar_line(radar_result, radar_available),
                 radar_triggered=bool(radar_result and radar_result["triggered"]),
             )
             send_telegram_message(bot_token, chat_id, reply)
-        except (requests.RequestException, IndexError, KeyError) as exc:
+        except (requests.RequestException, ValueError) as exc:
             logger.error("Failed to answer location query: %s", exc)
             try:
                 send_telegram_message(

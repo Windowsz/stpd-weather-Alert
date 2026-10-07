@@ -6,7 +6,7 @@ Frames are plain images, so we:
 
 1. classify echo pixels by matching them against the colour bar drawn on each
    frame (colour -> dBZ),
-2. estimate how the echoes are moving (phase correlation of the last two
+2. estimate how the echoes are moving (cross-correlation of the last two
    frames), and
 3. look "upwind" of the target point to see whether rain is there now or is
    about to arrive within the next hour.
@@ -45,8 +45,7 @@ DBZ_TOP = 66.5  # lower edge of the top (white) swatch
 DBZ_STEP = 2.478
 COLOR_TOLERANCE = 6
 MIN_ECHO_SPREAD = 100  # echo colours are vivid; map/terrain pixels are greyish
-MIN_DBZ = 15  # ignore weaker returns (mostly clutter / noise)
-CLUTTER_MIN_FRAMES = 8  # same dBZ at the same pixel in this many frames = ground clutter
+MIN_DBZ = 15  # ignore weaker returns (static ground clutter near the radar is below this)
 
 # Rain definition and search geometry.
 RADAR_DBZ_THRESHOLD = 25  # ~1.4 mm/h with Z = 200 R^1.6
@@ -55,7 +54,7 @@ MOTION_WINDOW_KM = 70  # echoes this close to the point are used to estimate mot
 MOTION_BLUR_PX = 6  # Gaussian sigma applied before correlating
 MOTION_MIN_ECHO_PX = 150  # need this many echo pixels in both frames to trust motion
 MOTION_MAX_KMH = 100
-LEAD_TIMES_MIN = (0, 10, 20, 30, 40, 50, 60)
+LEAD_MAX_MIN = 60  # how far ahead to extrapolate
 
 
 def dbz_to_rain_rate(dbz):
@@ -109,17 +108,6 @@ def dbz_field(frame, palette):
     inside = (xx - CENTER_PX[0]) ** 2 + (yy - CENTER_PX[1]) ** 2 <= (RADAR_RANGE_KM / KM_PER_PX) ** 2
     field[~inside] = 0
     return field
-
-
-def remove_clutter(fields):
-    """Zero out pixels that show the same dBZ in most frames (static ground
-    clutter) - real rain moves and changes between frames."""
-    stack = np.array(fields)
-    same = (stack == stack[-1]) & (stack > 0)
-    persistent = same.sum(axis=0) >= min(CLUTTER_MIN_FRAMES, len(fields))
-    for field in fields:
-        field[persistent] = 0
-    return fields
 
 
 def latlon_to_px(lat, lon):
@@ -191,38 +179,52 @@ def _bearing_text(dx, dy):
     return names[int((bearing + 22.5) // 45) % 8]
 
 
-def analyze_radar(frames, lat, lon):
-    """Radar nowcast for a point.
+def prepare_radar(frames):
+    """dBZ fields of the last two frames (the only ones the nowcast needs)."""
+    palette = build_palette(frames[-1])
+    return {
+        "prev": dbz_field(frames[-2], palette) if len(frames) >= 2 else None,
+        "curr": dbz_field(frames[-1], palette),
+    }
+
+
+def analyze_radar(prepared, lat, lon):
+    """Radar nowcast for a point, from prepare_radar() output.
 
     Returns None if the point is outside radar coverage, else a dict:
-      covered, now_dbz, motion_kmh / from_direction (or None), eta_min (None if
-      no rain expected within an hour), peak_dbz (strongest echo that will
-      reach the point), triggered.
+      now_dbz, motion_kmh / from_direction (or None), eta_min (None if no rain
+      expected within LEAD_MAX_MIN), peak_dbz (echo that will reach the point),
+      triggered.
     """
     point = latlon_to_px(lat, lon)
     dist_km = math.hypot(point[0] - CENTER_PX[0], point[1] - CENTER_PX[1]) * KM_PER_PX
     if dist_km > RADAR_RANGE_KM - 15:
         return None
 
-    palette = build_palette(frames[-1])
-    fields = remove_clutter([dbz_field(frame, palette) for frame in frames])
-    curr = fields[-1]
+    curr = prepared["curr"]
     now_dbz = max_dbz_near(curr, point, TARGET_RADIUS_KM)
 
     motion = None
-    if len(fields) >= 2:
-        motion = estimate_motion(fields[-2], curr, point)
+    if prepared["prev"] is not None:
+        motion = estimate_motion(prepared["prev"], curr, point)
 
     eta_min, peak_dbz = None, 0.0
     if now_dbz >= RADAR_DBZ_THRESHOLD:
         eta_min, peak_dbz = 0, now_dbz
     elif motion is not None:
-        for t in LEAD_TIMES_MIN[1:]:
-            frac = t / FRAME_INTERVAL_MIN
+        # Walk upwind in steps no longer than the search radius so fast-moving
+        # cells can't slip between samples.
+        intervals = LEAD_MAX_MIN / FRAME_INTERVAL_MIN
+        path_px = math.hypot(*motion) * intervals
+        radius_px = TARGET_RADIUS_KM / KM_PER_PX
+        steps = max(6, math.ceil(path_px / radius_px))
+        for i in range(1, steps + 1):
+            frac = intervals * i / steps
             upwind = (point[0] - motion[0] * frac, point[1] - motion[1] * frac)
             dbz = max_dbz_near(curr, upwind, TARGET_RADIUS_KM)
             if dbz >= RADAR_DBZ_THRESHOLD:
-                eta_min, peak_dbz = t, dbz
+                eta_min = max(5, int(round(frac * FRAME_INTERVAL_MIN / 5)) * 5)
+                peak_dbz = dbz
                 break
 
     result = {
@@ -251,15 +253,16 @@ def fetch_radar_size():
         return None
 
 
-def fetch_radar_frames():
-    """Download and decode the radar loop. Returns frames, or None on failure."""
+def fetch_radar():
+    """Download the radar loop and prepare it for analyze_radar().
+    Returns None on any failure so radar problems never break the alert run."""
     try:
         logger.info("Fetching TMD radar loop...")
         response = requests.get(RADAR_GIF_URL, timeout=RADAR_DOWNLOAD_TIMEOUT)
         response.raise_for_status()
         frames = load_frames(response.content)
         logger.info("Radar loop fetched (%d frames).", len(frames))
-        return frames
-    except (requests.RequestException, OSError, ValueError) as exc:
+        return prepare_radar(frames)
+    except Exception as exc:  # noqa: BLE001 - radar is optional; log and carry on
         logger.warning("Could not fetch/decode radar loop: %s", exc)
         return None
