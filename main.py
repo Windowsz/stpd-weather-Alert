@@ -563,9 +563,69 @@ def check_home_alert(bot_token, chat_id, state):
         state["radar_size"] = new_radar_size
 
 
+def handle_message(bot_token, allowed_chat_id, message):
+    """Reply to one Telegram message that contains a Google Maps link, a shared
+    location or a bare 'lat, lon' with the rain forecast for that spot.
+    Messages from other chats, or without a location, are ignored."""
+    chat_id = message.get("chat", {}).get("id")
+    if str(chat_id) != str(allowed_chat_id):
+        logger.info("Ignoring message from unrecognized chat_id=%s.", chat_id)
+        return
+
+    try:
+        coords = extract_query_location(message)
+    except Exception as exc:  # noqa: BLE001 - a bad message must not break the caller
+        logger.warning("Failed to parse location from message: %s", exc)
+        coords = None
+
+    if not coords:
+        maps_url = find_google_maps_url(message.get("text") or message.get("caption"))
+        if not maps_url:
+            return
+
+        logger.info("Found a Google Maps link but could not extract coordinates: %s", maps_url)
+        try:
+            send_telegram_message(
+                bot_token, chat_id,
+                "⚠️ ขออภัยครับ ไม่สามารถแกะพิกัดจากลิงก์นี้ได้ "
+                "(ลิงก์ประเภทนี้ไม่มีพิกัดฝังอยู่โดยตรง มักเกิดกับลิงก์แชร์ร้าน/สถานที่จากแอปมือถือ)\n\n"
+                "ลองวิธีนี้แทนครับ:\n"
+                "• กดค้างบนตำแหน่งในแผนที่เพื่อปักหมุดเอง แล้วกด Share จะได้ลิงก์ที่มีพิกัดฝังอยู่\n"
+                "• หรือกด 📎 ใน Telegram แล้วเลือก Location เพื่อแชร์พิกัดโดยตรง (แม่นยำสุด)",
+            )
+        except requests.RequestException:
+            pass
+        return
+
+    lat, lon = coords
+    logger.info("Location query received: lat=%s, lon=%s", lat, lon)
+
+    analysis = fetch_forecast_analysis(lat, lon)
+    radar_result, radar_text, _ = radar_nowcast(lat, lon)
+    try:
+        if analysis is None and radar_result is None:
+            raise ValueError("neither forecast nor radar data available")
+        reply = build_query_reply_message(
+            lat, lon, analysis,
+            radar_text=radar_text,
+            radar_triggered=bool(radar_result and radar_result["triggered"]),
+        )
+        send_telegram_message(bot_token, chat_id, reply)
+        send_radar_photo(bot_token, chat_id, lat, lon, radar_result)
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("Failed to answer location query: %s", exc)
+        try:
+            send_telegram_message(
+                bot_token, chat_id,
+                "⚠️ ไม่สามารถดึงข้อมูลพยากรณ์อากาศสำหรับพิกัดนี้ได้ กรุณาลองใหม่อีกครั้ง",
+            )
+        except requests.RequestException:
+            pass
+
+
 def process_location_queries(bot_token, allowed_chat_id, state):
-    """Check for new Telegram messages containing a Google Maps link (or a
-    shared location) and reply with the rain forecast for that spot."""
+    """Local/polling mode: fetch new Telegram messages with getUpdates and
+    answer each one. (On Vercel, api/telegram.py receives them by webhook.)"""
     try:
         updates = get_telegram_updates(bot_token, offset=state.get("last_update_id"))
     except requests.RequestException as exc:
@@ -581,70 +641,16 @@ def process_location_queries(bot_token, allowed_chat_id, state):
 
     for update in updates:
         highest_update_id = max(highest_update_id, update["update_id"] + 1)
-
         message = update.get("message") or update.get("edited_message")
-        if not message:
-            continue
-
-        chat_id = message.get("chat", {}).get("id")
-        if str(chat_id) != str(allowed_chat_id):
-            logger.info("Ignoring message from unrecognized chat_id=%s.", chat_id)
-            continue
-
-        try:
-            coords = extract_query_location(message)
-        except Exception as exc:  # noqa: BLE001 - keep processing other updates
-            logger.warning("Failed to parse location from message: %s", exc)
-            coords = None
-
-        if not coords:
-            maps_url = find_google_maps_url(message.get("text") or message.get("caption"))
-            if not maps_url:
-                continue
-
-            logger.info("Found a Google Maps link but could not extract coordinates: %s", maps_url)
-            try:
-                send_telegram_message(
-                    bot_token, chat_id,
-                    "⚠️ ขออภัยครับ ไม่สามารถแกะพิกัดจากลิงก์นี้ได้ "
-                    "(ลิงก์ประเภทนี้ไม่มีพิกัดฝังอยู่โดยตรง มักเกิดกับลิงก์แชร์ร้าน/สถานที่จากแอปมือถือ)\n\n"
-                    "ลองวิธีนี้แทนครับ:\n"
-                    "• กดค้างบนตำแหน่งในแผนที่เพื่อปักหมุดเอง แล้วกด Share จะได้ลิงก์ที่มีพิกัดฝังอยู่\n"
-                    "• หรือกด 📎 ใน Telegram แล้วเลือก Location เพื่อแชร์พิกัดโดยตรง (แม่นยำสุด)",
-                )
-            except requests.RequestException:
-                pass
-            continue
-
-        lat, lon = coords
-        logger.info("Location query received: lat=%s, lon=%s", lat, lon)
-
-        analysis = fetch_forecast_analysis(lat, lon)
-        radar_result, radar_text, _ = radar_nowcast(lat, lon)
-        try:
-            if analysis is None and radar_result is None:
-                raise ValueError("neither forecast nor radar data available")
-            reply = build_query_reply_message(
-                lat, lon, analysis,
-                radar_text=radar_text,
-                radar_triggered=bool(radar_result and radar_result["triggered"]),
-            )
-            send_telegram_message(bot_token, chat_id, reply)
-            send_radar_photo(bot_token, chat_id, lat, lon, radar_result)
-        except (requests.RequestException, ValueError) as exc:
-            logger.error("Failed to answer location query: %s", exc)
-            try:
-                send_telegram_message(
-                    bot_token, chat_id,
-                    "⚠️ ไม่สามารถดึงข้อมูลพยากรณ์อากาศสำหรับพิกัดนี้ได้ กรุณาลองใหม่อีกครั้ง",
-                )
-            except requests.RequestException:
-                pass
+        if message:
+            handle_message(bot_token, allowed_chat_id, message)
 
     state["last_update_id"] = highest_update_id
 
 
 def main():
+    """Local run: one home check plus polling for queries, with state in
+    data/state.json. Production runs on Vercel (see api/)."""
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 

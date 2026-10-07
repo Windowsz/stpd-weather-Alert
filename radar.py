@@ -254,13 +254,16 @@ def dbz_to_rain_rate(dbz):
     return (10 ** (dbz / 10) / 200) ** (1 / 1.6)
 
 
-def load_frames(gif_bytes):
-    """Decode every frame of the GIF into RGB numpy arrays (oldest first)."""
+def load_frames(gif_bytes, keep_last=None):
+    """Decode the GIF's frames into RGB numpy arrays (oldest first). GIF frames
+    must be decoded in order, but only the last `keep_last` are kept in memory."""
     image = Image.open(io.BytesIO(gif_bytes))
+    first = 0 if keep_last is None else max(image.n_frames - keep_last, 0)
     frames = []
     for index in range(image.n_frames):
         image.seek(index)
-        frames.append(np.array(image.convert("RGB")))
+        if index >= first:
+            frames.append(np.array(image.convert("RGB")))
     return frames
 
 
@@ -524,7 +527,7 @@ def fetch_radar():
         logger.info("Fetching TMD radar loop...")
         response = requests.get(RADAR_GIF_URL, timeout=RADAR_DOWNLOAD_TIMEOUT)
         response.raise_for_status()
-        frames = load_frames(response.content)
+        frames = load_frames(response.content, keep_last=2)
         logger.info("Radar loop fetched (%d frames).", len(frames))
         return prepare_radar(frames)
     except Exception as exc:  # noqa: BLE001 - radar is optional; log and carry on
