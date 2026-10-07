@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 
 logger = logging.getLogger("rain-alert")
 
@@ -56,6 +56,11 @@ MOTION_BLUR_PX = 6  # Gaussian sigma applied before correlating
 MOTION_MIN_ECHO_PX = 150  # need this many echo pixels in both frames to trust motion
 MOTION_MAX_KMH = 100
 LEAD_MAX_MIN = 60  # how far ahead to extrapolate
+
+# Telegram snapshot: latest frame cropped around the point.
+SNAPSHOT_HALF_KM = 75
+SNAPSHOT_SIZE_PX = 800
+SNAPSHOT_MARKER = (255, 0, 255)
 
 
 # Frame timestamp, drawn bottom-right as "YYYY-MM-DD HH:MM:SS" in UTC. Digits
@@ -401,7 +406,39 @@ def prepare_radar(frames):
         "prev": dbz_field(frames[-2], palette) if len(frames) >= 2 else None,
         "curr": dbz_field(frames[-1], palette),
         "time": read_frame_time(frames[-1]),
+        "image": frames[-1],
     }
+
+
+def render_snapshot(prepared, lat, lon, motion_px=None):
+    """JPEG bytes of the latest frame cropped around (lat, lon), with a marker
+    on the point and, if known, an arrow showing where the rain comes from
+    (the stretch the echoes cover in 30 minutes)."""
+    image = prepared["image"]
+    h, w, _ = image.shape
+    px, py = latlon_to_px(lat, lon)
+    half = int(SNAPSHOT_HALF_KM / KM_PER_PX)
+    x0 = min(max(int(px) - half, 0), w - 2 * half)
+    y0 = min(max(int(py) - half, 0), h - 2 * half)
+    crop = Image.fromarray(image[y0:y0 + 2 * half, x0:x0 + 2 * half])
+    crop = crop.resize((SNAPSHOT_SIZE_PX, SNAPSHOT_SIZE_PX), Image.LANCZOS)
+
+    scale = SNAPSHOT_SIZE_PX / (2 * half)
+    cx, cy = (px - x0) * scale, (py - y0) * scale
+    draw = ImageDraw.Draw(crop)
+    if motion_px is not None and math.hypot(*motion_px) > 0:
+        frac = 30 / FRAME_INTERVAL_MIN
+        sx = cx - motion_px[0] * frac * scale
+        sy = cy - motion_px[1] * frac * scale
+        draw.line((sx, sy, cx, cy), fill=SNAPSHOT_MARKER, width=4)
+        draw.ellipse((sx - 6, sy - 6, sx + 6, sy + 6), fill=SNAPSHOT_MARKER)
+    r = TARGET_RADIUS_KM / KM_PER_PX * scale
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=SNAPSHOT_MARKER, width=4)
+    draw.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), fill=SNAPSHOT_MARKER)
+
+    out = io.BytesIO()
+    crop.save(out, format="JPEG", quality=85)
+    return out.getvalue()
 
 
 def analyze_radar(prepared, lat, lon, age_min=0):
@@ -457,6 +494,7 @@ def analyze_radar(prepared, lat, lon, age_min=0):
         "now_dbz": now_dbz,
         "peak_dbz": peak_dbz,
         "eta_min": eta_min,
+        "motion_px": motion,
         "motion_kmh": None,
         "from_direction": None,
         "triggered": eta_min is not None,

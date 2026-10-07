@@ -321,6 +321,36 @@ def send_telegram_message(bot_token, chat_id, message):
     return response.json()
 
 
+def send_telegram_photo(bot_token, chat_id, photo_bytes, caption):
+    """Send a JPEG photo with a short Markdown caption to a Telegram chat."""
+    url = f"{TELEGRAM_API_BASE.format(token=bot_token)}/sendPhoto"
+    payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
+    files = {"photo": ("radar.jpg", photo_bytes, "image/jpeg")}
+
+    logger.info("Sending radar photo to Telegram chat_id=%s...", chat_id)
+    response = requests.post(url, data=payload, files=files, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def send_radar_photo(bot_token, chat_id, lat, lon, radar_result):
+    """Follow up a message with the radar snapshot around (lat, lon). Best
+    effort: the text message already went out, so failures are only logged."""
+    prepared = get_radar()
+    if prepared is None or radar_result is None:
+        return
+    try:
+        photo = radar.render_snapshot(prepared, lat, lon, radar_result.get("motion_px"))
+        frame_time = prepared.get("time")
+        when = f" ภาพ {_bangkok_hhmm(frame_time)}" if frame_time else ""
+        caption = f"🛰️ เรดาร์ TMD สุวรรณภูมิ{when}\n⭕ = พิกัดที่เช็ค"
+        if radar_result.get("from_direction"):
+            caption += ", เส้นสีชมพู = ทิศที่ฝนเคลื่อนเข้ามา (ยาวเท่าระยะ 30 นาที)"
+        send_telegram_photo(bot_token, chat_id, photo, caption)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not send radar photo: %s", exc)
+
+
 def get_telegram_updates(bot_token, offset=None):
     """Fetch pending updates (messages) sent to the bot."""
     url = f"{TELEGRAM_API_BASE.format(token=bot_token)}/getUpdates"
@@ -523,6 +553,8 @@ def check_home_alert(bot_token, chat_id, state):
         logger.error("Failed to send Telegram alert: %s", exc)
         return
 
+    send_radar_photo(bot_token, chat_id, LATITUDE, LONGITUDE, radar_result)
+
     if model_triggered:
         state["last_home_alert_time"] = analysis["window_start"]
     if radar_triggered:
@@ -598,6 +630,7 @@ def process_location_queries(bot_token, allowed_chat_id, state):
                 radar_triggered=bool(radar_result and radar_result["triggered"]),
             )
             send_telegram_message(bot_token, chat_id, reply)
+            send_radar_photo(bot_token, chat_id, lat, lon, radar_result)
         except (requests.RequestException, ValueError) as exc:
             logger.error("Failed to answer location query: %s", exc)
             try:
