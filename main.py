@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rain Alert - checks Open-Meteo forecast and sends Telegram alerts.
+"""Rain Alert - checks Open-Meteo forecasts and sends Telegram alerts.
 
 Two features:
 1. Scheduled home-location check: alerts if rain is likely in the next hour.
@@ -27,8 +27,15 @@ BANGKOK_TZ = ZoneInfo(TIMEZONE)
 HOME_LABEL = "บ้าน นนทบุรี"
 HOME_COORD_TOLERANCE = 0.001  # ~110m, for matching a shared pin to home
 
-RAIN_PROBABILITY_THRESHOLD = 50  # percent
-RAIN_AMOUNT_THRESHOLD = 0.1  # mm
+# A model "votes rain" when, anywhere in the look-ahead window, its rain amount
+# reaches RAIN_AMOUNT_THRESHOLD and (if it reports one) its probability reaches
+# RAIN_PROBABILITY_THRESHOLD. An alert needs MIN_MODEL_VOTES models to agree.
+FORECAST_MODELS = ("ecmwf_ifs025", "icon_global", "gfs_global")
+MIN_MODEL_VOTES = 2
+WINDOW_HOURS = 3  # look-ahead window, starting 1 hour from now
+ALERT_COOLDOWN_HOURS = 2  # don't re-alert for the same rain spell
+RAIN_PROBABILITY_THRESHOLD = 40  # percent
+RAIN_AMOUNT_THRESHOLD = 0.5  # mm per hour
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}"
@@ -53,13 +60,14 @@ logger = logging.getLogger("rain-alert")
 
 
 def fetch_forecast(lat, lon):
-    """Fetch hourly precipitation forecast from Open-Meteo for a given point."""
+    """Fetch hourly precipitation forecasts from several Open-Meteo models."""
     params = {
         "latitude": lat,
         "longitude": lon,
         "hourly": "precipitation_probability,precipitation,showers",
+        "models": ",".join(FORECAST_MODELS),
         "timezone": TIMEZONE,
-        "forecast_days": 1,
+        "forecast_days": 2,  # 2 days so the window never runs off the end near midnight
     }
 
     logger.info("Fetching forecast from Open-Meteo (lat=%s, lon=%s)...", lat, lon)
@@ -70,13 +78,14 @@ def fetch_forecast(lat, lon):
     return data
 
 
-def get_next_hour_index(times):
-    """Find the hourly array index matching exactly 1 hour from now (Bangkok time)."""
+def get_window_start_index(times):
+    """Index of the first hourly slot of the look-ahead window (1 hour from now,
+    Bangkok time). Raises IndexError if the data doesn't cover it."""
     target = (datetime.now(BANGKOK_TZ) + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
     target_str = target.strftime("%Y-%m-%dT%H:%M")
-    if target_str in times:
-        return times.index(target_str)
-    return min(1, len(times) - 1)
+    if target_str not in times:
+        raise IndexError(f"Slot {target_str} not found in hourly data")
+    return times.index(target_str)
 
 
 def format_display_time(time_str):
@@ -90,57 +99,100 @@ def is_home_location(lat, lon):
     return abs(lat - LATITUDE) <= HOME_COORD_TOLERANCE and abs(lon - LONGITUDE) <= HOME_COORD_TOLERANCE
 
 
-def extract_forecast_point(data, index):
-    """Extract a single hourly forecast point at the given index."""
+def _series(hourly, name, model):
+    """Hourly list for a variable/model; Open-Meteo suffixes keys with the model name."""
+    return hourly.get(f"{name}_{model}") or hourly.get(name) or []
+
+
+def analyze_forecast(data, start_index, window_hours=WINDOW_HOURS):
+    """Summarise each model's rain forecast over the look-ahead window and count
+    how many models agree that rain is likely.
+
+    Note: Open-Meteo's `precipitation` already includes showers, so showers are
+    reported separately but never added on top."""
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
-    probabilities = hourly.get("precipitation_probability", [])
-    precipitations = hourly.get("precipitation", [])
-    showers = hourly.get("showers", [])
-
-    if index >= len(times):
+    end_index = start_index + window_hours
+    if end_index > len(times):
         raise IndexError(
-            f"Requested index {index} is out of range for hourly data "
+            f"Window {start_index}-{end_index} is out of range for hourly data "
             f"(length={len(times)})"
         )
 
+    window_times = times[start_index:end_index]
+    models = {}
+    for model in FORECAST_MODELS:
+        precip = _series(hourly, "precipitation", model)[start_index:end_index]
+        prob = _series(hourly, "precipitation_probability", model)[start_index:end_index]
+        showers = _series(hourly, "showers", model)[start_index:end_index]
+        if not any(v is not None for v in precip):
+            continue  # model has no data for this location/time
+
+        peak_rain = max((v or 0) for v in precip)
+        peak_slot = window_times[[(v or 0) for v in precip].index(peak_rain)]
+        probs = [v for v in prob if v is not None]
+        peak_prob = max(probs) if probs else None
+        peak_showers = max((v or 0) for v in showers) if showers else 0
+
+        votes_rain = peak_rain >= RAIN_AMOUNT_THRESHOLD and (
+            peak_prob is None or peak_prob >= RAIN_PROBABILITY_THRESHOLD
+        )
+        models[model] = {
+            "peak_rain": peak_rain,
+            "peak_slot": peak_slot,
+            "peak_prob": peak_prob,
+            "peak_showers": peak_showers,
+            "votes_rain": votes_rain,
+        }
+
+    votes = sum(1 for m in models.values() if m["votes_rain"])
+    needed = min(MIN_MODEL_VOTES, len(models)) if models else MIN_MODEL_VOTES
     return {
-        "time": times[index],
-        "precipitation_probability": probabilities[index],
-        "precipitation": precipitations[index],
-        "showers": showers[index],
+        "window_start": window_times[0],
+        "window_end": window_times[-1],
+        "models": models,
+        "votes": votes,
+        "model_count": len(models),
+        "triggered": bool(models) and votes >= needed,
     }
 
 
-def should_alert(forecast_point):
-    """Determine whether the rain conditions warrant an alert."""
-    probability = forecast_point["precipitation_probability"] or 0
-    precipitation = forecast_point["precipitation"] or 0
-    showers = forecast_point["showers"] or 0
-    total_rain = precipitation + showers
+def _model_lines(analysis):
+    """One line per model: peak rain / probability and whether it voted for rain."""
+    lines = []
+    for name, m in analysis["models"].items():
+        prob = f"{m['peak_prob']:.0f}%" if m["peak_prob"] is not None else "-"
+        mark = "☔" if m["votes_rain"] else "▫️"
+        lines.append(f"{mark} `{name}`: {m['peak_rain']:.1f} มม./ชม., โอกาส {prob}")
+    return "\n".join(lines)
 
-    triggered = probability >= RAIN_PROBABILITY_THRESHOLD or total_rain > RAIN_AMOUNT_THRESHOLD
-    return triggered, probability, total_rain
+
+def _window_text(analysis):
+    start = format_display_time(analysis["window_start"])
+    end = datetime.strptime(analysis["window_end"], "%Y-%m-%dT%H:%M").strftime("%H:%M น.")
+    return f"{start} – {end}"
 
 
-def build_alert_message(lat, lon, forecast_point, total_rain):
+def build_alert_message(lat, lon, analysis):
     """Build a nicely formatted Markdown message for the scheduled home alert."""
     return (
         "🌧️ *แจ้งเตือนฝนตก* 🌧️\n\n"
         f"📍 *พิกัด:* `{lat}, {lon}` ({HOME_LABEL})\n"
-        f"🕐 *ช่วงเวลา:* {format_display_time(forecast_point['time'])}\n\n"
-        f"☔️ *โอกาสเกิดฝน:* `{forecast_point['precipitation_probability']}%`\n"
-        f"💧 *ปริมาณฝน:* `{forecast_point['precipitation']} มม.`\n"
-        f"🌦️ *Showers:* `{forecast_point['showers']} มม.`\n"
-        f"📊 *รวมปริมาณน้ำฝน:* `{total_rain:.2f} มม.`\n\n"
+        f"🕐 *ช่วงเวลา:* {_window_text(analysis)}\n\n"
+        f"🗳️ *โมเดลที่เห็นตรงกันว่าฝนตก:* {analysis['votes']}/{analysis['model_count']}\n"
+        f"{_model_lines(analysis)}\n\n"
         "_แนะนำให้เตรียมร่มหรือเสื้อกันฝนไว้ล่วงหน้า_"
     )
 
 
-def build_query_reply_message(lat, lon, forecast_point, total_rain, triggered):
+def build_query_reply_message(lat, lon, analysis):
     """Build a Markdown reply for an on-demand location query."""
+    triggered = analysis["triggered"]
     status_emoji = "🌧️" if triggered else "🌤️"
-    status_text = "*มีแนวโน้มฝนตกในชั่วโมงหน้า!*" if triggered else "ไม่มีแนวโน้มฝนตกในชั่วโมงหน้า"
+    status_text = (
+        f"*มีแนวโน้มฝนตกใน {WINDOW_HOURS} ชั่วโมงข้างหน้า!*"
+        if triggered else f"ไม่มีแนวโน้มฝนตกใน {WINDOW_HOURS} ชั่วโมงข้างหน้า"
+    )
     maps_link = f"https://www.google.com/maps?q={lat},{lon}"
     home_suffix = f" ({HOME_LABEL})" if is_home_location(lat, lon) else ""
 
@@ -148,11 +200,9 @@ def build_query_reply_message(lat, lon, forecast_point, total_rain, triggered):
         f"{status_emoji} *ผลการเช็คพยากรณ์ฝน*\n\n"
         f"📍 *พิกัด:* `{lat}, {lon}`{home_suffix}\n"
         f"🔗 [เปิดใน Google Maps]({maps_link})\n"
-        f"🕐 *ช่วงเวลา:* {format_display_time(forecast_point['time'])}\n\n"
-        f"☔️ *โอกาสเกิดฝน:* `{forecast_point['precipitation_probability']}%`\n"
-        f"💧 *ปริมาณฝน:* `{forecast_point['precipitation']} มม.`\n"
-        f"🌦️ *Showers:* `{forecast_point['showers']} มม.`\n"
-        f"📊 *รวมปริมาณน้ำฝน:* `{total_rain:.2f} มม.`\n\n"
+        f"🕐 *ช่วงเวลา:* {_window_text(analysis)}\n\n"
+        f"🗳️ *โมเดลที่เห็นตรงกันว่าฝนตก:* {analysis['votes']}/{analysis['model_count']}\n"
+        f"{_model_lines(analysis)}\n\n"
         f"{status_text}"
     )
 
@@ -289,54 +339,59 @@ def extract_query_location(message):
     return extract_plain_latlon(text)
 
 
-def check_home_alert(bot_token, chat_id, state):
-    """Check the home location and send an alert if rain is likely soon.
+def is_in_cooldown(last_alert_slot, window_start):
+    """True if the last alert was recent enough that this window is the same rain spell."""
+    if not last_alert_slot:
+        return False
+    fmt = "%Y-%m-%dT%H:%M"
+    elapsed = datetime.strptime(window_start, fmt) - datetime.strptime(last_alert_slot, fmt)
+    return elapsed < timedelta(hours=ALERT_COOLDOWN_HOURS)
 
-    Sends at most one alert per forecast hour-slot (tracked in `state`), so
-    running this frequently (e.g. every minute) doesn't spam repeat alerts
-    while the same rainy hour is still being forecast."""
+
+def check_home_alert(bot_token, chat_id, state):
+    """Check the home location and send an alert if enough models expect rain
+    in the next few hours.
+
+    Alerts are spaced at least ALERT_COOLDOWN_HOURS apart (tracked in `state`),
+    so running this frequently doesn't spam repeats for the same rain spell."""
     try:
         data = fetch_forecast(LATITUDE, LONGITUDE)
-        index = get_next_hour_index(data.get("hourly", {}).get("time", []))
-        forecast_point = extract_forecast_point(data, index)
+        index = get_window_start_index(data.get("hourly", {}).get("time", []))
+        analysis = analyze_forecast(data, index)
     except (requests.RequestException, IndexError, KeyError) as exc:
         logger.error("Failed to fetch or parse forecast data: %s", exc)
         return
 
-    logger.info(
-        "Home forecast at %s -> probability=%s%%, precipitation=%s mm, showers=%s mm",
-        forecast_point["time"],
-        forecast_point["precipitation_probability"],
-        forecast_point["precipitation"],
-        forecast_point["showers"],
-    )
-
-    triggered, probability, total_rain = should_alert(forecast_point)
-
-    if not triggered:
+    for name, m in analysis["models"].items():
         logger.info(
-            "No alert needed (probability=%s%%, total_rain=%.2f mm below thresholds).",
-            probability, total_rain,
+            "Model %s -> peak_rain=%.2f mm, peak_prob=%s, votes_rain=%s",
+            name, m["peak_rain"], m["peak_prob"], m["votes_rain"],
+        )
+
+    if not analysis["triggered"]:
+        logger.info(
+            "No alert needed (%d/%d models vote rain, need %d).",
+            analysis["votes"], analysis["model_count"], MIN_MODEL_VOTES,
         )
         return
 
-    if state.get("last_home_alert_time") == forecast_point["time"]:
+    if is_in_cooldown(state.get("last_home_alert_time"), analysis["window_start"]):
         logger.info(
-            "Already alerted for forecast slot %s, skipping duplicate.",
-            forecast_point["time"],
+            "Already alerted at %s (cooldown %dh), skipping duplicate.",
+            state.get("last_home_alert_time"), ALERT_COOLDOWN_HOURS,
         )
         return
 
     logger.info(
-        "Rain condition triggered! (probability=%s%%, total_rain=%.2f mm). Sending alert...",
-        probability, total_rain,
+        "Rain condition triggered! (%d/%d models). Sending alert...",
+        analysis["votes"], analysis["model_count"],
     )
 
-    message = build_alert_message(LATITUDE, LONGITUDE, forecast_point, total_rain)
+    message = build_alert_message(LATITUDE, LONGITUDE, analysis)
 
     try:
         send_telegram_message(bot_token, chat_id, message)
-        state["last_home_alert_time"] = forecast_point["time"]
+        state["last_home_alert_time"] = analysis["window_start"]
     except requests.RequestException as exc:
         logger.error("Failed to send Telegram alert: %s", exc)
 
@@ -399,10 +454,9 @@ def process_location_queries(bot_token, allowed_chat_id, state):
 
         try:
             data = fetch_forecast(lat, lon)
-            index = get_next_hour_index(data.get("hourly", {}).get("time", []))
-            forecast_point = extract_forecast_point(data, index)
-            triggered, _, total_rain = should_alert(forecast_point)
-            reply = build_query_reply_message(lat, lon, forecast_point, total_rain, triggered)
+            index = get_window_start_index(data.get("hourly", {}).get("time", []))
+            analysis = analyze_forecast(data, index)
+            reply = build_query_reply_message(lat, lon, analysis)
             send_telegram_message(bot_token, chat_id, reply)
         except (requests.RequestException, IndexError, KeyError) as exc:
             logger.error("Failed to answer location query: %s", exc)
