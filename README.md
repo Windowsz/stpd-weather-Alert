@@ -101,9 +101,12 @@
 1. สมัคร/เข้าสู่ระบบ [Vercel](https://vercel.com/) ด้วยบัญชี GitHub (แพ็กเกจ Hobby ฟรี สำหรับใช้งานส่วนตัวที่ไม่ใช่เชิงพาณิชย์)
 2. กด **Add New… > Project** แล้วเลือก repo นี้ (เป็น private ได้) และเลือก Framework Preset เป็น **Other**
 3. ที่ **Settings > Git** ตั้ง Production Branch ให้ตรงกับ branch หลักของ repo
-4. สร้างฐานข้อมูลเก็บ state: ในโปรเจกต์ Vercel ไปที่ **Storage** แล้วเพิ่ม **Upstash Redis** (แพ็กเกจฟรี)
-   และเชื่อมกับโปรเจกต์นี้ Vercel จะเพิ่มตัวแปร `KV_REST_API_URL` และ `KV_REST_API_TOKEN` ให้อัตโนมัติ
-   (หรือสมัครที่ [upstash.com](https://upstash.com/) เองแล้วใส่ `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`)
+4. สร้างฐานข้อมูลเก็บ state ที่ [console.upstash.com](https://console.upstash.com/) (สมัครฟรี เข้าด้วย GitHub/Google ได้)
+   - กด **Create Database** เลือกชนิด **Redis** ตั้งชื่ออะไรก็ได้ เลือก region ใกล้ไทย (เช่น Singapore) และแพ็กเกจ **Free**
+   - ในหน้าฐานข้อมูล เลื่อนไปที่ส่วน **REST API** แล้วคัดลอก `UPSTASH_REDIS_REST_URL` และ `UPSTASH_REDIS_REST_TOKEN`
+     (ไม่ใช่ token แบบ read-only) ไปใส่ใน Environment Variables ข้อถัดไป
+   - หรือถ้าในโปรเจกต์ Vercel มีเมนู **Storage / Marketplace** ให้เพิ่ม Upstash Redis จากตรงนั้นแทนก็ได้
+     (Vercel จะใส่ `KV_REST_API_URL` / `KV_REST_API_TOKEN` ให้เอง โค้ดรองรับทั้งสองแบบ)
 5. ที่ **Settings > Environment Variables** เพิ่มตัวแปรต่อไปนี้:
 
    | Name | Value |
@@ -112,6 +115,8 @@
    | `TELEGRAM_CHAT_ID` | Chat ID ที่ได้จาก @userinfobot |
    | `CRON_SECRET` | รหัสสุ่มยาว ๆ ที่ตั้งเอง (ใช้กับ cron-job.org) |
    | `TELEGRAM_WEBHOOK_SECRET` | รหัสสุ่มอีกตัว ใช้ได้แค่ `A-Z a-z 0-9 _ -` (ใช้กับ webhook ของ Telegram) |
+   | `UPSTASH_REDIS_REST_URL` | REST URL จาก Upstash (ข้ามได้ถ้าเพิ่มผ่าน Vercel Storage) |
+   | `UPSTASH_REDIS_REST_TOKEN` | REST Token จาก Upstash (ข้ามได้ถ้าเพิ่มผ่าน Vercel Storage) |
 
    สร้างรหัสสุ่มได้ด้วย `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`
 6. กด **Redeploy** เพื่อให้ตัวแปรใหม่มีผล แล้วจด URL ของโปรเจกต์ไว้ เช่น `https://your-project.vercel.app`
