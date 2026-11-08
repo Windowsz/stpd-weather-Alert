@@ -39,7 +39,7 @@ MIN_MODEL_VOTES = 2
 WINDOW_HOURS = 3  # hourly slots looked at, starting with the current hour
 ALERT_COOLDOWN_HOURS = 2  # don't re-alert on the models for the same rain spell
 RADAR_ALERT_COOLDOWN_MIN = 60  # radar alerts have their own, shorter cooldown
-RADAR_MAX_AGE_MIN = 50  # ignore the radar if its latest frame is older (TMD normally lags 10-35 min)
+RADAR_MAX_AGE_MIN = 40  # frames come every 10 min; content unchanged this long = TMD stopped updating
 RAIN_PROBABILITY_THRESHOLD = 40  # percent
 RAIN_AMOUNT_THRESHOLD = 0.5  # mm per hour
 
@@ -176,53 +176,63 @@ def get_radar():
     return _radar_cache["prepared"]
 
 
-def radar_nowcast(lat, lon):
+def radar_age_min(prepared, state):
+    """Minutes since the radar file's content last changed, as far as `state`
+    remembers (0 when the content is new to us or nothing is remembered)."""
+    if state and state.get("radar_digest") == prepared.get("digest") and state.get("radar_changed_at"):
+        changed_at = datetime.fromisoformat(state["radar_changed_at"])
+        return max((datetime.now(timezone.utc) - changed_at).total_seconds() / 60, 0)
+    return 0
+
+
+def remember_radar(state):
+    """Record in `state` when the radar content changed, so later runs can
+    tell a frozen feed from a live one."""
+    prepared = _radar_cache["prepared"]
+    if prepared and state.get("radar_digest") != prepared.get("digest"):
+        state["radar_digest"] = prepared.get("digest")
+        state["radar_changed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _duration_text(minutes):
+    return f"{minutes / 60:.0f} ชั่วโมง" if minutes >= 120 else f"{minutes:.0f} นาที"
+
+
+def radar_nowcast(lat, lon, state=None):
     """Radar nowcast for a point -> (result, text, fetched).
 
     `result` is None when there's nothing usable (download/analysis failed,
-    the latest frame is too old, or the point is out of range); `text` is the
+    the feed has stopped updating, or the point is out of range); `text` is the
     Telegram line to show either way; `fetched` says whether the loop was
-    downloaded. Never raises: radar is a bonus signal and must not break the run
-    (and with it, saving the Telegram offset)."""
+    downloaded. `state` (read only here) tells how long the content has been
+    unchanged. Never raises: radar is a bonus signal and must not break the run
+    (and with it, saving state)."""
     prepared = get_radar()
     if prepared is None:
         return None, "🛰️ *เรดาร์ TMD:* ดึงข้อมูลไม่สำเร็จ", False
 
-    frame_time = prepared.get("time")
-    age_min = 0
-    if frame_time is None:
-        logger.warning("Could not read the radar frame time; assuming it is current.")
-    else:
-        age_min = (datetime.now(timezone.utc) - frame_time).total_seconds() / 60
-        if age_min < -10:  # a frame from the future means the timestamp was misread
-            logger.warning("Radar frame time %s is in the future; ignoring it.", frame_time)
-            frame_time, age_min = None, 0
-        elif age_min > RADAR_MAX_AGE_MIN:
-            logger.warning("Radar frame is %.0f min old; not using it.", age_min)
-            return None, (
-                f"🛰️ *เรดาร์ TMD:* ภาพล่าสุดเก่าเกินไป ({_bangkok_hhmm(frame_time)}) "
-                "จึงไม่ใช้ข้อมูลเรดาร์รอบนี้"
-            ), True
+    age_min = radar_age_min(prepared, state)
+    if age_min > RADAR_MAX_AGE_MIN:
+        logger.warning("Radar content unchanged for %.0f min; not using it.", age_min)
+        return None, (
+            f"🛰️ *เรดาร์ TMD:* ภาพเรดาร์ไม่อัปเดตมาแล้วราว {_duration_text(age_min)} "
+            "(ฝั่ง TMD อาจมีปัญหา) จึงไม่ใช้ข้อมูลเรดาร์รอบนี้"
+        ), True
 
     try:
         result = radar.analyze_radar(prepared, lat, lon, age_min)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Radar analysis failed: %s", exc)
         return None, "🛰️ *เรดาร์ TMD:* วิเคราะห์ข้อมูลไม่สำเร็จ", False
-    return result, radar_line(result, frame_time), True
+    return result, radar_line(result), True
 
 
-def _bangkok_hhmm(utc_time):
-    """'01:15 น.' style Bangkok time for a UTC datetime."""
-    return utc_time.astimezone(BANGKOK_TZ).strftime("%H:%M น.")
-
-
-def radar_line(radar_result, frame_time=None):
+def radar_line(radar_result):
     """One Telegram line describing the radar nowcast."""
     if radar_result is None:
-        return "🛰️ *เรดาร์ TMD:* พิกัดนี้อยู่นอกรัศมีเรดาร์สุวรรณภูมิ"
+        return "🛰️ *เรดาร์ TMD:* พิกัดนี้อยู่นอกรัศมีเรดาร์สุวรรณภูมิ (120 กม.)"
 
-    label = f"🛰️ *เรดาร์ TMD* (ภาพ {_bangkok_hhmm(frame_time)}):" if frame_time else "🛰️ *เรดาร์ TMD:*"
+    label = "🛰️ *เรดาร์ TMD:*"
     motion = ""
     if radar_result["from_direction"]:
         motion = (
@@ -341,9 +351,7 @@ def send_radar_photo(bot_token, chat_id, lat, lon, radar_result):
         return
     try:
         photo = radar.render_snapshot(prepared, lat, lon, radar_result.get("motion_px"))
-        frame_time = prepared.get("time")
-        when = f" ภาพ {_bangkok_hhmm(frame_time)}" if frame_time else ""
-        caption = f"🛰️ เรดาร์ TMD สุวรรณภูมิ{when}\n⭕ = พิกัดที่เช็ค"
+        caption = "🛰️ เรดาร์ TMD สุวรรณภูมิ (ภาพล่าสุด)\n⭕ = พิกัดที่เช็ค"
         if radar_result.get("from_direction"):
             caption += ", เส้นสีชมพู = ทิศที่ฝนเคลื่อนเข้ามา (ยาวเท่าระยะ 30 นาที)"
         send_telegram_photo(bot_token, chat_id, photo, caption)
@@ -372,16 +380,19 @@ def load_state():
                 state = json.load(f)
                 state.setdefault("last_update_id", None)
                 state.setdefault("last_home_alert_time", None)
-                state.setdefault("radar_size", None)
                 state.setdefault("last_radar_alert_time", None)
+                state.setdefault("radar_digest", None)
+                state.setdefault("radar_changed_at", None)
+                state.pop("radar_size", None)  # replaced by radar_digest
                 return state
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read state file, starting fresh: %s", exc)
     return {
         "last_update_id": None,
         "last_home_alert_time": None,
-        "radar_size": None,
         "last_radar_alert_time": None,
+        "radar_digest": None,
+        "radar_changed_at": None,
     }
 
 
@@ -509,17 +520,9 @@ def check_home_alert(bot_token, chat_id, state):
                 name, m["peak_rain"], m["peak_prob"], m["votes_rain"],
             )
 
-    # Radar (nowcast) check. The GIF has no cache headers, but its size changes
-    # whenever a new frame is added, so an unchanged size means nothing new.
-    radar_result, radar_text, new_radar_size = None, "", None
-    size = radar.fetch_radar_size()
-    if size is not None and size == state.get("radar_size"):
-        logger.info("Radar loop unchanged since last run, skipping radar check.")
-    else:
-        radar_result, radar_text, fetched = radar_nowcast(LATITUDE, LONGITUDE)
-        if fetched:
-            new_radar_size = size
-            logger.info("Radar nowcast: %s", radar_result)
+    radar_result, radar_text, _ = radar_nowcast(LATITUDE, LONGITUDE, state)
+    remember_radar(state)
+    logger.info("Radar nowcast: %s", radar_result)
 
     now_slot = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%dT%H:%M")
     model_triggered = bool(analysis and analysis["triggered"])
@@ -538,8 +541,6 @@ def check_home_alert(bot_token, chat_id, state):
             logger.info("Rain expected but already alerted recently (cooldown), skipping.")
         else:
             logger.info("No alert needed (models and radar don't expect rain).")
-        if new_radar_size is not None:
-            state["radar_size"] = new_radar_size
         return
 
     logger.info("Rain condition triggered (models=%s, radar=%s). Sending alert...",
@@ -549,7 +550,7 @@ def check_home_alert(bot_token, chat_id, state):
     try:
         send_telegram_message(bot_token, chat_id, message)
     except requests.RequestException as exc:
-        # Leave radar_size unchanged so the next run re-checks the radar and retries.
+        # Cooldowns aren't updated, so the next run retries.
         logger.error("Failed to send Telegram alert: %s", exc)
         return
 
@@ -559,11 +560,9 @@ def check_home_alert(bot_token, chat_id, state):
         state["last_home_alert_time"] = analysis["window_start"]
     if radar_triggered:
         state["last_radar_alert_time"] = now_slot
-    if new_radar_size is not None:
-        state["radar_size"] = new_radar_size
 
 
-def handle_message(bot_token, allowed_chat_id, message):
+def handle_message(bot_token, allowed_chat_id, message, state=None):
     """Reply to one Telegram message that contains a Google Maps link, a shared
     location or a bare 'lat, lon' with the rain forecast for that spot.
     Messages from other chats, or without a location, are ignored."""
@@ -601,7 +600,7 @@ def handle_message(bot_token, allowed_chat_id, message):
     logger.info("Location query received: lat=%s, lon=%s", lat, lon)
 
     analysis = fetch_forecast_analysis(lat, lon)
-    radar_result, radar_text, _ = radar_nowcast(lat, lon)
+    radar_result, radar_text, _ = radar_nowcast(lat, lon, state)
     try:
         if analysis is None and radar_result is None:
             raise ValueError("neither forecast nor radar data available")
@@ -643,7 +642,7 @@ def process_location_queries(bot_token, allowed_chat_id, state):
         highest_update_id = max(highest_update_id, update["update_id"] + 1)
         message = update.get("message") or update.get("edited_message")
         if message:
-            handle_message(bot_token, allowed_chat_id, message)
+            handle_message(bot_token, allowed_chat_id, message, state)
 
     state["last_update_id"] = highest_update_id
 

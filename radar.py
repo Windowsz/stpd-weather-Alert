@@ -1,8 +1,9 @@
 """Rain-radar nowcasting from the TMD Suvarnabhumi radar loop GIF.
 
-The GIF (https://weather.tmd.go.th/svp/svpHQloop.gif) holds 12 frames, 15
-minutes apart (timestamps are UTC), covering a 240 km radius around the radar.
-Frames are plain images, so we:
+The GIF (https://weather.tmd.go.th/svp/svp120loop.gif) holds 12 frames, 10
+minutes apart, covering a 120 km radius around the radar. (The 240 km
+products, svpHQloop.gif and svp240_HQ_latest.jpg, stopped updating on
+2026-11-04.) Frames are plain images, so we:
 
 1. classify echo pixels by matching them against the colour bar drawn on each
    frame (colour -> dBZ),
@@ -13,12 +14,15 @@ Frames are plain images, so we:
 
 Image-to-map calibration (CENTER_PX, KM_PER_PX, RADAR_LAT/LON) was fitted by
 eye against landmarks, so ETAs are approximate (a few km / minutes).
+
+The printed frame time is too blurry to read reliably at this size, so callers
+judge freshness by when the file's content last changed (see `digest`).
 """
 
+import hashlib
 import io
 import logging
 import math
-from datetime import datetime, timezone
 
 import numpy as np
 import requests
@@ -26,21 +30,21 @@ from PIL import Image, ImageDraw
 
 logger = logging.getLogger("rain-alert")
 
-RADAR_GIF_URL = "https://weather.tmd.go.th/svp/svpHQloop.gif"
-RADAR_DOWNLOAD_TIMEOUT = (10, 90)  # (connect, read) seconds; the GIF is ~14 MB
+RADAR_GIF_URL = "https://weather.tmd.go.th/svp/svp120loop.gif"
+RADAR_DOWNLOAD_TIMEOUT = (10, 60)  # (connect, read) seconds; the GIF is ~4 MB
 
-# Geometry of the 1920x1600 frames.
+# Geometry of the 936x797 frames.
 RADAR_LAT = 13.69
 RADAR_LON = 100.76
-CENTER_PX = (960, 800)  # (x, y) of the radar
+CENTER_PX = (468, 399)  # (x, y) of the radar
 KM_PER_PX = 0.3
-RADAR_RANGE_KM = 235  # leave a margin inside the 240 km outer ring
-FRAME_INTERVAL_MIN = 15
+RADAR_RANGE_KM = 115  # leave a margin inside the 120 km outer ring
+FRAME_INTERVAL_MIN = 10
 
 # Colour bar: 25 swatches, top (strongest) to bottom, drawn in the left strip.
-BAR_X = 30
+BAR_X = 15
 BAR_Y_START = 7
-BAR_SWATCH_PX = 63.44
+BAR_SWATCH_PX = 31.36
 BAR_SWATCHES = 25
 DBZ_TOP = 66.5  # lower edge of the top (white) swatch
 DBZ_STEP = 2.478
@@ -58,195 +62,10 @@ MOTION_MAX_KMH = 100
 LEAD_MAX_MIN = 60  # how far ahead to extrapolate
 
 # Telegram snapshot: latest frame cropped around the point.
-SNAPSHOT_HALF_KM = 75
+SNAPSHOT_HALF_KM = 60
 SNAPSHOT_SIZE_PX = 800
 SNAPSHOT_MARKER = (255, 0, 255)
 
-
-# Frame timestamp, drawn bottom-right as "YYYY-MM-DD HH:MM:SS" in UTC. Digits
-# sit at fixed x offsets and are read by matching against DIGIT_GLYPHS
-# (binary bitmaps learned from real frames, see GLYPH_* for tolerances).
-STAMP_ROWS = (1569, 1584)
-STAMP_X0 = 1746
-STAMP_DIGIT_X = (17, 25, 34, 42, 58, 66, 78, 86, 101, 108, 122, 130, 143, 151)  # YYYYMMDDHHMMSS
-STAMP_WHITE = 200  # text is white; all channels above this
-GLYPH_WIDTH = 9
-GLYPH_SEARCH_PX = 3  # glyphs are anti-aliased at sub-pixel offsets
-GLYPH_MAX_ERROR = 32  # mismatched pixels (of 15x9) beyond which a digit is unreadable
-GLYPH_MIN_MARGIN = 4  # best match must beat the runner-up by this many pixels
-
-DIGIT_GLYPHS = {
-    "0": (
-        ".........",
-        "..##.....",
-        ".#####...",
-        "###.###..",
-        "##...##..",
-        "##...##..",
-        "##...##..",
-        "##...##..",
-        "##...##..",
-        "##...##..",
-        "##...##..",
-        "###.###..",
-        ".#####...",
-        "...#.....",
-        ".........",
-    ),
-    "1": (
-        ".........",
-        ".........",
-        "###.....#",
-        "###....##",
-        ".##....##",
-        ".##....##",
-        ".##....##",
-        ".##...###",
-        ".##....#.",
-        ".##....##",
-        ".##....##",
-        ".##....##",
-        ".##.....#",
-        ".........",
-        ".........",
-    ),
-    "2": (
-        ".........",
-        "..##.....",
-        "######...",
-        "##..###..",
-        "#....##..",
-        ".....##..",
-        "....###..",
-        "...###...",
-        "...##....",
-        "..##.....",
-        ".##......",
-        "#######..",
-        "########.",
-        ".........",
-        ".........",
-    ),
-    "3": (
-        ".........",
-        ".##......",
-        "#####....",
-        "#..###..#",
-        "#...##..#",
-        "....##..#",
-        ".####..##",
-        ".####..##",
-        "...###..#",
-        "....##..#",
-        "#...##..#",
-        "#..###..#",
-        "#####....",
-        ".........",
-        ".........",
-    ),
-    "4": (
-        ".........",
-        ".........",
-        "...##....",
-        "..###....",
-        ".####...#",
-        ".####...#",
-        "##.##...#",
-        "##.##...#",
-        "#..##....",
-        "#######..",
-        "#######.#",
-        "...##...#",
-        "...##....",
-        ".........",
-        ".........",
-    ),
-    "5": (
-        ".........",
-        ".###.#...",
-        ".######..",
-        ".#####...",
-        "###......",
-        "#####....",
-        "######...",
-        "###.###..",
-        ".....##..",
-        ".....##..",
-        "##...##..",
-        "###.###..",
-        ".#####...",
-        ".........",
-        ".........",
-    ),
-    "6": (
-        ".........",
-        ".........",
-        "...####..",
-        "..####...",
-        ".###.....",
-        ".##.##...",
-        ".######..",
-        ".###.###.",
-        ".##...##.",
-        ".##...##.",
-        ".##...##.",
-        ".###.###.",
-        "..#####..",
-        ".........",
-        ".........",
-    ),
-    "7": (
-        ".........",
-        "....##...",
-        "########.",
-        "......##.",
-        "......##.",
-        ".....##..",
-        ".....##..",
-        "....##...",
-        "....##...",
-        "...##....",
-        "...##....",
-        "..###....",
-        "..##.....",
-        ".........",
-        ".........",
-    ),
-    "8": (
-        ".........",
-        "..##.....",
-        ".#####...",
-        "###.###..",
-        "##...##..",
-        "##...##..",
-        "######...",
-        ".#####...",
-        "##..###..",
-        "##...##..",
-        "##...##..",
-        "###.###..",
-        ".#####...",
-        ".........",
-        ".........",
-    ),
-    "9": (
-        ".........",
-        "..##.....",
-        ".#####...",
-        "##..###..",
-        "##...##..",
-        "##...##..",
-        "##...##..",
-        "##..###..",
-        "#######..",
-        "..##.##..",
-        "....##...",
-        ".#####...",
-        ".####....",
-        ".........",
-        ".........",
-    ),
-}
 
 
 def dbz_to_rain_rate(dbz):
@@ -374,41 +193,13 @@ def _bearing_text(dx, dy):
     return names[int((bearing + 22.5) // 45) % 8]
 
 
-def _read_digit(text, x):
-    """Best-matching digit for the glyph at column x, or None if unsure."""
-    scores = []
-    for digit, glyph in _GLYPH_ARRAYS.items():
-        best = min(
-            int((text[:, x + dx:x + dx + GLYPH_WIDTH] ^ glyph).sum())
-            for dx in range(-GLYPH_SEARCH_PX, GLYPH_SEARCH_PX + 1)
-        )
-        scores.append((best, digit))
-    scores.sort()
-    if scores[0][0] > GLYPH_MAX_ERROR or scores[1][0] - scores[0][0] < GLYPH_MIN_MARGIN:
-        return None
-    return scores[0][1]
-
-
-def read_frame_time(frame):
-    """UTC timestamp printed on a frame, or None if it can't be read reliably."""
-    try:
-        text = frame[STAMP_ROWS[0]:STAMP_ROWS[1], STAMP_X0 - GLYPH_SEARCH_PX:].astype(int).min(axis=2) > STAMP_WHITE
-        digits = [_read_digit(text, x + GLYPH_SEARCH_PX) for x in STAMP_DIGIT_X]
-        if None in digits:
-            return None
-        return datetime.strptime("".join(digits), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-    except (ValueError, IndexError):
-        return None
-
-
 def prepare_radar(frames):
     """dBZ fields of the last two frames (the only ones the nowcast needs),
-    plus the latest frame's UTC time (None if unreadable)."""
+    plus the latest frame itself (for snapshots)."""
     palette = build_palette(frames[-1])
     return {
         "prev": dbz_field(frames[-2], palette) if len(frames) >= 2 else None,
         "curr": dbz_field(frames[-1], palette),
-        "time": read_frame_time(frames[-1]),
         "image": frames[-1],
     }
 
@@ -509,17 +300,6 @@ def analyze_radar(prepared, lat, lon, age_min=0):
     return result
 
 
-def fetch_radar_size():
-    """Size in bytes of the radar GIF (HEAD request), or None. Used to detect new frames."""
-    try:
-        response = requests.head(RADAR_GIF_URL, timeout=15, allow_redirects=True)
-        response.raise_for_status()
-        return int(response.headers["Content-Length"])
-    except (requests.RequestException, KeyError, ValueError) as exc:
-        logger.warning("Could not read radar loop size: %s", exc)
-        return None
-
-
 def fetch_radar():
     """Download the radar loop and prepare it for analyze_radar().
     Returns None on any failure so radar problems never break the alert run."""
@@ -529,13 +309,10 @@ def fetch_radar():
         response.raise_for_status()
         frames = load_frames(response.content, keep_last=2)
         logger.info("Radar loop fetched (%d frames).", len(frames))
-        return prepare_radar(frames)
+        prepared = prepare_radar(frames)
+        # Fingerprint of the content: unchanged for long = TMD stopped updating.
+        prepared["digest"] = hashlib.sha1(response.content).hexdigest()
+        return prepared
     except Exception as exc:  # noqa: BLE001 - radar is optional; log and carry on
         logger.warning("Could not fetch/decode radar loop: %s", exc)
         return None
-
-
-_GLYPH_ARRAYS = {
-    digit: np.array([[ch == "#" for ch in row] for row in rows])
-    for digit, rows in DIGIT_GLYPHS.items()
-}

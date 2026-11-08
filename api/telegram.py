@@ -18,6 +18,15 @@ from webutil import secret_matches, send_json  # noqa: E402
 logger = logging.getLogger("rain-alert")
 
 
+def _read_state():
+    """State for judging radar freshness (read only: the cron check owns writes)."""
+    try:
+        return state_store.load_state()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read state: %s", exc)
+        return None
+
+
 def _first_delivery(update_id):
     """Dedup Telegram redeliveries; if Redis is down, answer anyway (a possible
     duplicate reply beats no reply)."""
@@ -47,7 +56,8 @@ class handler(BaseHTTPRequestHandler):
         try:
             if message and update_id is not None and _first_delivery(update_id):
                 main.handle_message(
-                    os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"], message
+                    os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"], message,
+                    _read_state(),
                 )
         except Exception:  # noqa: BLE001
             # Still answer 200: a non-2xx makes Telegram redeliver the same

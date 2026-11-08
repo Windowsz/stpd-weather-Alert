@@ -17,8 +17,9 @@ UPDATE_DEDUP_SECONDS = 24 * 3600
 
 DEFAULT_STATE = {
     "last_home_alert_time": None,
-    "radar_size": None,
     "last_radar_alert_time": None,
+    "radar_digest": None,
+    "radar_changed_at": None,
 }
 
 
@@ -50,6 +51,7 @@ def load_state():
     state = dict(DEFAULT_STATE)
     if raw:
         state.update(json.loads(raw))
+    state.pop("radar_size", None)  # replaced by radar_digest
     return state
 
 
