@@ -1,15 +1,18 @@
 # 🌧️ Rain Alert - แจ้งเตือนฝนล่วงหน้าผ่าน Telegram
 
 โปรเจกต์นี้ใช้ Python สแกนพยากรณ์อากาศจาก [Open-Meteo API](https://open-meteo.com/) (ฟรี ไม่ต้องใช้ API Key)
-เพื่อเช็คโอกาสเกิดฝนล่วงหน้า 3 ชั่วโมง และส่งข้อความแจ้งเตือนเข้า Telegram โดยอัตโนมัติทุก 5 นาที
-ผ่าน GitHub Actions (บอทจะไม่แจ้งซ้ำสำหรับฝนรอบเดียวกัน แม้เช็คถี่)
-นอกจากนี้ยังสามารถ **ถามพยากรณ์ฝนของสถานที่อื่นได้ทันทีผ่าน Telegram**
-โดยการส่งลิงก์ Google Maps, พิกัดตรงๆ, หรือแชร์พิกัด เข้าไปในแชท บอทจะแกะพิกัดแล้วตอบกลับผลพยากรณ์ให้อัตโนมัติ
+ร่วมกับภาพเรดาร์ฝนของกรมอุตุนิยมวิทยา เพื่อเตือนฝนล่วงหน้าเข้า Telegram
+รันได้ 2 แบบ:
 
-> ⚠️ หมายเหตุ: 5 นาทีคือ**ค่าต่ำสุดที่ GitHub Actions รองรับได้จริง** ตามเอกสารทางการของ GitHub
-> (เคยลองตั้งทุก 1 นาทีแล้ว แต่ GitHub ไม่รันตามจริง — ปล่อยเงียบไปหลายนาทีโดยไม่มี run เกิดขึ้นเลย)
-> และถึงจะตั้ง 5 นาที ก็ยังไม่การันตี exact timing 100% ช่วงที่ระบบ GitHub โหลดสูงอาจดีเลย์เพิ่มได้อีก
-> ถ้าอยากได้คำตอบทันที ให้กด **Run workflow** เองแทนการรอ
+- **GitHub Actions** (แบบที่ใช้อยู่เดิม ตั้งค่าน้อยสุด แต่ cron ของ GitHub มักรันห่างกันหลายชั่วโมง ไม่ใช่ทุก 5 นาทีตามที่ตั้ง
+  และ repo ต้องเป็น public ถึงจะไม่กินโควตานาที)
+- **Vercel + cron-job.org** (ฟรี เช็คบ้านตรงเวลาทุก 5 นาที ตอบพิกัดที่ถามได้ทันทีผ่าน webhook และตั้ง repo เป็น private ได้)
+
+ใช้แบบใดแบบหนึ่งเท่านั้น ถ้าย้ายไป Vercel แล้วให้ลบหรือปิด workflow `.github/workflows/check-rain.yml`
+ไม่เช่นนั้นจะได้คำเตือนซ้ำจากทั้งสองที่
+
+นอกจากเตือนบ้านแล้วยังสามารถ **ถามพยากรณ์ฝนของสถานที่อื่นผ่าน Telegram** ได้
+โดยส่งลิงก์ Google Maps, พิกัดตรงๆ หรือแชร์พิกัดเข้าไปในแชท
 
 สามารถแก้ไขพิกัดได้ที่ตัวแปร `LATITUDE` และ `LONGITUDE` ในไฟล์ `main.py`
 
@@ -29,7 +32,10 @@
 ## 🛰️ เรดาร์ฝน TMD (nowcast 0–60 นาที)
 
 นอกจากโมเดลพยากรณ์ บอทยังวิเคราะห์ภาพเรดาร์สุวรรณภูมิของกรมอุตุนิยมวิทยา
-([svpHQloop.gif](https://weather.tmd.go.th/svp/svpHQloop.gif), รัศมี 240 กม., 12 เฟรม ห่างกัน 15 นาที, เวลาในภาพเป็น UTC) โดย
+([svp120loop.gif](https://weather.tmd.go.th/svp/svp120loop.gif), รัศมี 120 กม., 12 เฟรม ห่างกัน 10 นาที) โดย
+
+> ไฟล์รัศมี 240 กม. (`svpHQloop.gif`, `svp240_HQ_latest.jpg`) หยุดอัปเดตตั้งแต่ 4 พ.ย. 2026 บอทจึงเปลี่ยนมาใช้ภาพ 120 กม.
+> ซึ่งยังครอบคลุมกรุงเทพฯ ปริมณฑล อยุธยา ชลบุรี ถึงพัทยา แต่พิกัดที่ไกลกว่า 120 กม. จากสุวรรณภูมิจะไม่มีข้อมูลเรดาร์
 
 1. แปลงสีของแต่ละพิกเซลเป็นค่า dBZ ตามแถบสีบนภาพ (ตัดสัญญาณที่อ่อนกว่า 15 dBZ ซึ่งส่วนใหญ่เป็นสัญญาณสะท้อนจากพื้นดินรอบเรดาร์)
 2. ประมาณทิศและความเร็วที่กลุ่มฝนเคลื่อนที่ จากการเทียบ 2 เฟรมล่าสุด
@@ -40,17 +46,16 @@
 ข้อมูลเรดาร์จะแสดงในข้อความตอบกลับเวลาถามพิกัดอื่นด้วย (เฉพาะพิกัดในรัศมีเรดาร์)
 
 **ส่งภาพเรดาร์ไปด้วย:** ทุกครั้งที่แจ้งเตือนบ้านหรือตอบพิกัดที่ถาม บอทจะส่งรูปเฟรมล่าสุดตามหลังข้อความ
-โดยตัดเฉพาะรอบพิกัดราว 150×150 กม. วงกลมสีชมพูคือพิกัดที่เช็ค และเส้นสีชมพูชี้ไปทางที่ฝนกำลังเคลื่อนเข้ามา (ยาวเท่าระยะ 30 นาที)
-ถ้าภาพเก่าเกินไปหรือพิกัดอยู่นอกรัศมีเรดาร์จะไม่ส่งรูป
+โดยตัดเฉพาะรอบพิกัดราว 120×120 กม. วงกลมสีชมพูคือพิกัดที่เช็ค และเส้นสีชมพูชี้ไปทางที่ฝนกำลังเคลื่อนเข้ามา (ยาวเท่าระยะ 30 นาที)
+ถ้าภาพไม่อัปเดตหรือพิกัดอยู่นอกรัศมีเรดาร์จะไม่ส่งรูป
 
-**เช็คภาพเก่า:** บอทอ่านเวลาที่พิมพ์อยู่มุมขวาล่างของภาพ (เวลา UTC แปลงเป็นเวลาไทย +7 ก่อนแสดง เช่น "ภาพ 01:45 น.")
-ถ้าภาพล่าสุดเก่ากว่า 50 นาที (ปกติ TMD ช้ากว่าเวลาจริงราว 10–35 นาที) จะไม่ใช้ข้อมูลเรดาร์รอบนั้นและแจ้งในข้อความ
-และเวลาที่คาดว่าฝนจะถึงจะหักอายุของภาพออกแล้ว (นับจากเวลาปัจจุบัน ไม่ใช่เวลาของภาพ)
-ถ้าอ่านเวลาไม่ออก (เช่น TMD เปลี่ยนฟอนต์) บอทจะยังใช้ภาพต่อแต่บันทึกคำเตือนไว้ใน log
+**เช็คภาพเก่า:** เวลาที่พิมพ์บนภาพ 120 กม. ตัวเล็กและแตกเกินกว่าจะอ่านได้แม่น บอทจึงจำลายนิ้วมือ (hash) ของไฟล์ไว้ใน state
+แล้วดูว่าเนื้อหาไม่เปลี่ยนมานานเท่าไร ถ้าเกิน 40 นาที (ปกติมีเฟรมใหม่ทุก 10 นาที) ถือว่า TMD หยุดอัปเดต
+จะไม่ใช้ข้อมูลเรดาร์รอบนั้นและบอกในข้อความว่าภาพไม่อัปเดตมานานเท่าไร
 
-ข้อจำกัด: ไฟล์ GIF ใหญ่ (~14 MB) บอทจึงตรวจขนาดไฟล์ก่อน (`radar_size` ใน `data/state.json`) และจะวิเคราะห์ใหม่เมื่อมีเฟรมใหม่เท่านั้น
 ตำแหน่งพิกัด↔พิกเซลปรับเทียบด้วยตาจากจุดสังเกตบนแผนที่ (ค่าที่ต้นไฟล์ `radar.py`) ความคลาดเคลื่อนของเวลา/ระยะที่คาดจึงอยู่ที่ระดับไม่กี่กม./นาที
 การคาดการณ์แบบนี้ใช้ได้ดีกับกลุ่มฝนที่เคลื่อนต่อเนื่อง แต่เตือนไม่ได้ถ้าฝนก่อตัวขึ้นใหม่เหนือพิกัดโดยตรง
+ถ้า TMD เปลี่ยนชื่อไฟล์หรือรูปแบบภาพอีก ต้องแก้ค่าที่ต้นไฟล์ `radar.py` (URL, ตำแหน่งเรดาร์บนภาพ, ตำแหน่งแถบสี)
 
 ## 🗺️ ถามพยากรณ์ฝนของสถานที่อื่นผ่าน Telegram (Google Maps Link)
 
@@ -66,17 +71,10 @@
   ส่งเป็นข้อความธรรมดาได้เลย (ปนกับข้อความอื่นก็ยังจับได้ เช่น "เช็คฝนที่ 13.76, 100.56 หน่อย")
 - **แชร์ตำแหน่งผ่าน Telegram** — กดปุ่ม 📎 แล้วเลือก **Location** เพื่อแชร์พิกัดปัจจุบันโดยตรง (แม่นยำที่สุด)
 
-จากนั้น:
-1. รอจนกว่า Workflow จะรันรอบถัดไป (สูงสุด ~5 นาที ตาม Cron แต่ GitHub อาจดีเลย์ได้ในบางช่วง)
-   หรือกด **Run workflow** เพื่อให้ตอบกลับทันที
-2. บอทจะตอบกลับข้อความพยากรณ์ฝนของพิกัดนั้น พร้อมลิงก์เปิดใน Google Maps
+บอทจะตอบกลับข้อความพยากรณ์ฝนของพิกัดนั้นทันที พร้อมลิงก์เปิดใน Google Maps และรูปเรดาร์
 
-> หมายเหตุ: เพื่อความปลอดภัย บอทจะตอบกลับเฉพาะข้อความที่ส่งมาจากแชทที่ตรงกับ `TELEGRAM_CHAT_ID`
-> ที่ตั้งค่าไว้ใน Secrets เท่านั้น ข้อความจากแชทอื่นจะถูกเพิกเฉย
->
-> การอ่านข้อความใหม่ ๆ (Telegram `getUpdates`) ต้องใช้การจำ "ตำแหน่งข้อความล่าสุดที่อ่านแล้ว" (`last_update_id`)
-> ซึ่งเก็บไว้ในไฟล์ `data/state.json` และ Workflow จะ commit ไฟล์นี้กลับเข้า Repository อัตโนมัติหลังรันทุกครั้ง
-> (ต้องเปิดสิทธิ์ `contents: write` ให้ Workflow ซึ่งตั้งค่าไว้ให้แล้วใน `check-rain.yml`)
+> หมายเหตุ: เพื่อความปลอดภัย บอทจะตอบกลับเฉพาะข้อความที่ส่งมาจากแชทที่ตรงกับ `TELEGRAM_CHAT_ID` เท่านั้น
+> ข้อความจากแชทอื่นจะถูกเพิกเฉย และ endpoint ของ webhook จะรับเฉพาะคำขอที่มี `TELEGRAM_WEBHOOK_SECRET` ถูกต้อง
 
 ---
 
@@ -104,40 +102,63 @@
 > ⚠️ **สำคัญ:** หลังจากได้ Token และ Chat ID แล้ว ให้เปิดแชทกับ Bot ที่สร้างไว้ในขั้นตอนที่ 1
 > แล้วกด **Start** หรือส่งข้อความอย่างน้อย 1 ครั้ง เพื่อให้ Bot สามารถส่งข้อความกลับมาหาคุณได้
 
-### 3. นำโค้ดขึ้น GitHub Repository
+### 3A. รันด้วย GitHub Actions (แบบเดิม)
 
-1. สร้าง Repository ใหม่บน GitHub (Public หรือ Private ก็ได้)
-2. อัปโหลดไฟล์ทั้งหมดในโปรเจกต์นี้ขึ้น Repository เช่น:
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit: Rain Alert project"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/<your-repo>.git
-   git push -u origin main
-   ```
+1. ที่ repo ไปที่ **Settings > Secrets and variables > Actions** แล้วเพิ่ม `TELEGRAM_BOT_TOKEN` และ `TELEGRAM_CHAT_ID`
+2. ไปที่แท็บ **Actions** เปิดใช้ workflow **Rain Alert Automation** แล้วลองกด **Run workflow**
+3. workflow จะรันตาม cron และ commit `data/state.json` กลับเข้า repo หลังรันแต่ละรอบ
 
-### 4. ตั้งค่า Secrets ใน GitHub Repository
+ข้อ 3–6 ด้านล่างเป็นการตั้งค่าแบบ Vercel ถ้าใช้ GitHub Actions ข้ามได้เลย
 
-1. เข้าไปที่หน้า Repository บน GitHub
-2. ไปที่ **Settings** > **Secrets and variables** > **Actions**
-3. กด **New repository secret** แล้วเพิ่ม Secrets ทั้ง 2 ตัวดังนี้:
+### 3. Deploy ขึ้น Vercel
+
+1. สมัคร/เข้าสู่ระบบ [Vercel](https://vercel.com/) ด้วยบัญชี GitHub (แพ็กเกจ Hobby ฟรี สำหรับใช้งานส่วนตัวที่ไม่ใช่เชิงพาณิชย์)
+2. กด **Add New… > Project** แล้วเลือก repo นี้ (เป็น private ได้) และเลือก Framework Preset เป็น **Other**
+3. ที่ **Settings > Git** ตั้ง Production Branch ให้ตรงกับ branch หลักของ repo
+4. สร้างฐานข้อมูลเก็บ state ที่ [console.upstash.com](https://console.upstash.com/) (สมัครฟรี เข้าด้วย GitHub/Google ได้)
+   - กด **Create Database** เลือกชนิด **Redis** ตั้งชื่ออะไรก็ได้ เลือก region ใกล้ไทย (เช่น Singapore) และแพ็กเกจ **Free**
+   - ในหน้าฐานข้อมูล เลื่อนไปที่ส่วน **REST API** แล้วคัดลอก `UPSTASH_REDIS_REST_URL` และ `UPSTASH_REDIS_REST_TOKEN`
+     (ไม่ใช่ token แบบ read-only) ไปใส่ใน Environment Variables ข้อถัดไป
+   - หรือถ้าในโปรเจกต์ Vercel มีเมนู **Storage / Marketplace** ให้เพิ่ม Upstash Redis จากตรงนั้นแทนก็ได้
+     (Vercel จะใส่ `KV_REST_API_URL` / `KV_REST_API_TOKEN` ให้เอง โค้ดรองรับทั้งสองแบบ)
+5. ที่ **Settings > Environment Variables** เพิ่มตัวแปรต่อไปนี้:
 
    | Name | Value |
    | --- | --- |
    | `TELEGRAM_BOT_TOKEN` | Token ที่ได้จาก @BotFather |
    | `TELEGRAM_CHAT_ID` | Chat ID ที่ได้จาก @userinfobot |
+   | `CRON_SECRET` | รหัสสุ่มยาว ๆ ที่ตั้งเอง (ใช้กับ cron-job.org) |
+   | `TELEGRAM_WEBHOOK_SECRET` | รหัสสุ่มอีกตัว ใช้ได้แค่ `A-Z a-z 0-9 _ -` (ใช้กับ webhook ของ Telegram) |
+   | `UPSTASH_REDIS_REST_URL` | REST URL จาก Upstash (ข้ามได้ถ้าเพิ่มผ่าน Vercel Storage) |
+   | `UPSTASH_REDIS_REST_TOKEN` | REST Token จาก Upstash (ข้ามได้ถ้าเพิ่มผ่าน Vercel Storage) |
 
-4. กด **Add secret** เพื่อบันทึกแต่ละค่า
+   สร้างรหัสสุ่มได้ด้วย `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`
+6. กด **Redeploy** เพื่อให้ตัวแปรใหม่มีผล แล้วจด URL ของโปรเจกต์ไว้ เช่น `https://your-project.vercel.app`
 
-### 5. เปิดใช้งาน GitHub Actions
+### 4. ผูก Telegram webhook (ทำครั้งเดียว)
 
-1. ไปที่แท็บ **Actions** ของ Repository
-2. หากมีข้อความให้ยืนยันการเปิดใช้งาน Workflow ให้กด **I understand my workflows, go ahead and enable them**
-3. เลือก Workflow ชื่อ **Rain Alert Automation**
-4. ทดสอบรันด้วยตนเองโดยกด **Run workflow** (ปุ่มนี้มาจาก `workflow_dispatch`)
-5. เมื่อรันสำเร็จ ระบบจะเริ่มทำงานอัตโนมัติทุก 5 นาที ตาม Cron `*/5 * * * *`
-   (ไม่ต้องกังวลเรื่องแจ้งเตือนซ้ำ บอทแจ้งเตือนแค่ครั้งเดียวต่อรอบพยากรณ์ 1 ชั่วโมง)
+เปิด URL นี้ในเบราว์เซอร์ (แทนค่าในวงเล็บเหลี่ยม):
+
+```
+https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<your-project>.vercel.app/api/telegram&secret_token=<TELEGRAM_WEBHOOK_SECRET>
+```
+
+ต้องได้ผลลัพธ์ `{"ok":true,...}` ตรวจสถานะได้ที่ `https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo`
+จากนั้นลองส่งพิกัดเข้าไปในแชท บอทควรตอบกลับภายในไม่กี่วินาที
+
+### 5. ตั้งเวลาเช็คพิกัดบ้านด้วย cron-job.org
+
+1. สมัคร [cron-job.org](https://cron-job.org/) แล้วกด **Create cronjob**
+2. URL: `https://<your-project>.vercel.app/api/check`
+3. Execution schedule: **Every 5 minutes**
+4. ที่แท็บ **Advanced > Headers** เพิ่ม header `Authorization` ค่า `Bearer <CRON_SECRET>`
+5. ตั้ง timeout เป็น 60 วินาที แล้วกด **Test run** ต้องได้สถานะ 200 และผลลัพธ์ `{"ok": true, ...}`
+   (ถ้าได้ 401 แปลว่า header ไม่ตรงกับ `CRON_SECRET`)
+
+### 6. ตั้ง repo เป็น private (ถ้าต้องการ)
+
+ที่ GitHub ไปที่ **Settings > General > Danger Zone > Change repository visibility**
+Vercel ยัง deploy จาก repo private ของบัญชีส่วนตัวได้ตามปกติ
 
 ---
 
@@ -145,13 +166,19 @@
 
 ```
 .
-├── .github/
-│   └── workflows/
-│       └── check-rain.yml    # GitHub Actions Workflow
+├── .github/workflows/
+│   └── check-rain.yml   # GitHub Actions (ถ้าใช้แบบ Actions): รัน main.py ตาม cron
 ├── data/
-│   └── state.json            # เก็บ last_update_id ของ Telegram (สร้างอัตโนมัติ)
-├── main.py                   # สคริปต์หลักสำหรับเช็คพยากรณ์, ส่งแจ้งเตือน, และตอบคำถามพิกัด
-├── requirements.txt          # รายการไลบรารีที่ต้องใช้
+│   └── state.json       # state ของแบบ Actions (workflow commit กลับให้อัตโนมัติ)
+├── api/
+│   ├── check.py         # Vercel function: เช็คพิกัดบ้าน (cron-job.org เรียกทุก 5 นาที)
+│   └── telegram.py      # Vercel function: Telegram webhook ตอบคำถามพิกัด
+├── main.py              # ตรรกะหลัก: พยากรณ์, โหวตโมเดล, ข้อความ, การแจ้งเตือน (แบบ Actions/รันบนเครื่องเรียกไฟล์นี้)
+├── radar.py             # วิเคราะห์ภาพเรดาร์ TMD (dBZ, ทิศทางฝน, ภาพ snapshot)
+├── state_store.py       # เก็บ state ใน Upstash Redis (แบบ Vercel)
+├── webutil.py           # ตัวช่วย HTTP ของ Vercel functions
+├── vercel.json          # ตั้งค่า Vercel (เวลารันสูงสุดของ function)
+├── requirements.txt
 └── README.md
 ```
 
@@ -166,9 +193,12 @@ export TELEGRAM_CHAT_ID="your-chat-id"
 python main.py
 ```
 
+โหมดนี้เช็คพิกัดบ้านหนึ่งรอบและเก็บ state ไว้ที่ `data/state.json` บนเครื่อง
+ส่วนการอ่านข้อความแบบ `getUpdates` จะใช้ไม่ได้ระหว่างที่ผูก webhook ไว้ (Telegram ตอบ 409) ซึ่งไม่กระทบการเช็คบ้าน
+
+
 ## 📝 หมายเหตุ
 
 - Open-Meteo API เป็นบริการฟรีและไม่ต้องใช้ API Key
-- GitHub Actions บน Free Plan มีข้อจำกัดเรื่องความแม่นยำของเวลา Schedule (อาจดีเลย์ได้บ้างเล็กน้อย)
-- หากต้องการปรับเงื่อนไขการแจ้งเตือน สามารถแก้ไขค่าคงที่ `RAIN_PROBABILITY_THRESHOLD`
-  และ `RAIN_AMOUNT_THRESHOLD` ได้ในไฟล์ `main.py`
+- หากต้องการปรับเงื่อนไขการแจ้งเตือน แก้ค่าคงที่ด้านบนของ `main.py` (โมเดล) และ `radar.py` (เรดาร์)
+- ดู log ได้ที่โปรเจกต์ Vercel > **Logs** และดูประวัติการเรียกได้ที่ cron-job.org
