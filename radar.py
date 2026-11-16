@@ -1,9 +1,10 @@
-"""Rain-radar nowcasting from the TMD Suvarnabhumi radar loop GIF.
+"""Rain-radar nowcasting from the TMD Suvarnabhumi high-quality radar loop.
 
-The GIF (https://weather.tmd.go.th/svp/svp120loop.gif) holds 12 frames, 10
-minutes apart, covering a 120 km radius around the radar. (The 240 km
-products, svpHQloop.gif and svp240_HQ_latest.jpg, stopped updating on
-2026-11-04.) Frames are plain images, so we:
+The GIF (https://weather.tmd.go.th/svp/svpHQloop.gif) is the file behind
+"Suvarnabhumi Loop (240)" on weather.tmd.go.th. The page draws it at 800 px
+and the Zoom buttons only scale that same image; the file itself is
+1920x1600, 12 frames, 15 minutes apart, covering a 240 km radius. Frames are
+plain images, so we:
 
 1. classify echo pixels by matching them against the colour bar drawn on each
    frame (colour -> dBZ),
@@ -12,11 +13,11 @@ products, svpHQloop.gif and svp240_HQ_latest.jpg, stopped updating on
 3. look "upwind" of the target point to see whether rain is there now or is
    about to arrive within the next hour.
 
-Image-to-map calibration (CENTER_PX, KM_PER_PX, RADAR_LAT/LON) was fitted by
-eye against landmarks, so ETAs are approximate (a few km / minutes).
+Image-to-map calibration (CENTER_PX, KM_PER_PX, RADAR_LAT/LON) was fitted
+against the crosshair and colour bar on the 1920x1600 frames, so ETAs are
+approximate (a few km / minutes).
 
-The printed frame time is too blurry to read reliably at this size, so callers
-judge freshness by when the file's content last changed (see `digest`).
+Callers judge freshness by when the file's content last changed (see `digest`).
 """
 
 import hashlib
@@ -30,21 +31,21 @@ from PIL import Image, ImageDraw
 
 logger = logging.getLogger("rain-alert")
 
-RADAR_GIF_URL = "https://weather.tmd.go.th/svp/svp120loop.gif"
-RADAR_DOWNLOAD_TIMEOUT = (10, 60)  # (connect, read) seconds; the GIF is ~4 MB
+RADAR_GIF_URL = "https://weather.tmd.go.th/svp/svpHQloop.gif"
+RADAR_DOWNLOAD_TIMEOUT = (10, 40)  # (connect, read) seconds; the GIF is ~15 MB
 
-# Geometry of the 936x797 frames.
+# Geometry of the 1920x1600 frames. The site crosshair sits on the radar.
 RADAR_LAT = 13.69
 RADAR_LON = 100.76
-CENTER_PX = (468, 399)  # (x, y) of the radar
+CENTER_PX = (960, 800)  # (x, y) of the radar
 KM_PER_PX = 0.3
-RADAR_RANGE_KM = 115  # leave a margin inside the 120 km outer ring
-FRAME_INTERVAL_MIN = 10
+RADAR_RANGE_KM = 235  # leave a margin inside the 240 km outer ring
+FRAME_INTERVAL_MIN = 15
 
 # Colour bar: 25 swatches, top (strongest) to bottom, drawn in the left strip.
-BAR_X = 15
-BAR_Y_START = 7
-BAR_SWATCH_PX = 31.36
+BAR_X = 30
+BAR_Y_START = 8
+BAR_SWATCH_PX = 63.36
 BAR_SWATCHES = 25
 DBZ_TOP = 66.5  # lower edge of the top (white) swatch
 DBZ_STEP = 2.478

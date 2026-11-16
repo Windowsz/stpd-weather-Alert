@@ -39,7 +39,7 @@ MIN_MODEL_VOTES = 2
 WINDOW_HOURS = 3  # hourly slots looked at, starting with the current hour
 ALERT_COOLDOWN_HOURS = 2  # don't re-alert on the models for the same rain spell
 RADAR_ALERT_COOLDOWN_MIN = 60  # radar alerts have their own, shorter cooldown
-RADAR_MAX_AGE_MIN = 40  # frames come every 10 min; content unchanged this long = TMD stopped updating
+RADAR_MAX_AGE_MIN = 40  # HQ frames come every 15 min; content unchanged this long = TMD stopped updating
 RAIN_PROBABILITY_THRESHOLD = 40  # percent
 RAIN_AMOUNT_THRESHOLD = 0.5  # mm per hour
 
@@ -230,7 +230,7 @@ def radar_nowcast(lat, lon, state=None):
 def radar_line(radar_result):
     """One Telegram line describing the radar nowcast."""
     if radar_result is None:
-        return "🛰️ *เรดาร์ TMD:* พิกัดนี้อยู่นอกรัศมีเรดาร์สุวรรณภูมิ (120 กม.)"
+        return "🛰️ *เรดาร์ TMD:* พิกัดนี้อยู่นอกรัศมีเรดาร์สุวรรณภูมิ (240 กม.)"
 
     label = "🛰️ *เรดาร์ TMD:*"
     motion = ""
