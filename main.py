@@ -598,6 +598,10 @@ def handle_message(bot_token, allowed_chat_id, message, state=None):
 
     lat, lon = coords
     logger.info("Location query received: lat=%s, lon=%s", lat, lon)
+    try:
+        send_telegram_message(bot_token, chat_id, "⏳ กำลังดึงข้อมูลพยากรณ์และเรดาร์...")
+    except requests.RequestException as exc:
+        logger.warning("Could not send the working notice: %s", exc)
 
     analysis = fetch_forecast_analysis(lat, lon)
     radar_result, radar_text, _ = radar_nowcast(lat, lon, state)
