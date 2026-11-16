@@ -165,33 +165,49 @@ def analyze_forecast(data, start_index, window_hours=WINDOW_HOURS):
     }
 
 
-_radar_cache = {"loaded": False, "prepared": None}
+_radar_cache = {}
 
 
-def get_radar():
-    """Download and prepare the TMD radar loop at most once per run (None if unavailable)."""
-    if not _radar_cache["loaded"]:
-        _radar_cache["prepared"] = radar.fetch_radar()
-        _radar_cache["loaded"] = True
-    return _radar_cache["prepared"]
+def get_radar(lat, lon):
+    """Download the nearest covering TMD station at most once per run.
+
+    Returns (site, prepared). prepared is None when no station covers the
+    point or every covering station failed to download. Tries the next
+    station when a download fails."""
+    sites = radar.stations_covering(lat, lon)
+    for site in sites:
+        sid = site["id"]
+        if sid not in _radar_cache:
+            _radar_cache[sid] = radar.fetch_radar(site)
+        if _radar_cache[sid] is not None:
+            return site, _radar_cache[sid]
+    return (sites[0] if sites else None), None
 
 
 def radar_age_min(prepared, state):
-    """Minutes since the radar file's content last changed, as far as `state`
+    """Minutes since this station's file last changed, as far as `state`
     remembers (0 when the content is new to us or nothing is remembered)."""
-    if state and state.get("radar_digest") == prepared.get("digest") and state.get("radar_changed_at"):
-        changed_at = datetime.fromisoformat(state["radar_changed_at"])
+    sites = (state or {}).get("radar_sites") or {}
+    entry = sites.get(prepared["site"]["id"]) or {}
+    if entry.get("digest") == prepared.get("digest") and entry.get("changed_at"):
+        changed_at = datetime.fromisoformat(entry["changed_at"])
         return max((datetime.now(timezone.utc) - changed_at).total_seconds() / 60, 0)
     return 0
 
 
-def remember_radar(state):
-    """Record in `state` when the radar content changed, so later runs can
-    tell a frozen feed from a live one."""
-    prepared = _radar_cache["prepared"]
-    if prepared and state.get("radar_digest") != prepared.get("digest"):
-        state["radar_digest"] = prepared.get("digest")
-        state["radar_changed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def remember_radar(state, prepared):
+    """Record when this station's file changed, so later runs can tell a
+    frozen feed from a live one."""
+    if not prepared:
+        return
+    sites = state.setdefault("radar_sites", {})
+    sid = prepared["site"]["id"]
+    entry = sites.get(sid) or {}
+    if entry.get("digest") != prepared.get("digest"):
+        sites[sid] = {
+            "digest": prepared.get("digest"),
+            "changed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
 
 
 def _duration_text(minutes):
@@ -207,15 +223,18 @@ def radar_nowcast(lat, lon, state=None):
     downloaded. `state` (read only here) tells how long the content has been
     unchanged. Never raises: radar is a bonus signal and must not break the run
     (and with it, saving state)."""
-    prepared = get_radar()
+    site, prepared = get_radar(lat, lon)
+    if site is None:
+        return None, "🛰️ *เรดาร์ TMD:* พิกัดนี้อยู่นอกระยะเรดาร์ 240 กม. ของทุกสถานี", False
+    name = site["name"]
     if prepared is None:
-        return None, "🛰️ *เรดาร์ TMD:* ดึงข้อมูลไม่สำเร็จ", False
+        return None, f"🛰️ *เรดาร์ TMD {name}:* ดึงข้อมูลไม่สำเร็จ", False
 
     age_min = radar_age_min(prepared, state)
     if age_min > RADAR_MAX_AGE_MIN:
-        logger.warning("Radar content unchanged for %.0f min; not using it.", age_min)
+        logger.warning("Radar %s unchanged for %.0f min; not using it.", site["id"], age_min)
         return None, (
-            f"🛰️ *เรดาร์ TMD:* ภาพเรดาร์ไม่อัปเดตมาแล้วราว {_duration_text(age_min)} "
+            f"🛰️ *เรดาร์ TMD {name}:* ภาพเรดาร์ไม่อัปเดตมาแล้วราว {_duration_text(age_min)} "
             "(ฝั่ง TMD อาจมีปัญหา) จึงไม่ใช้ข้อมูลเรดาร์รอบนี้"
         ), True
 
@@ -223,16 +242,15 @@ def radar_nowcast(lat, lon, state=None):
         result = radar.analyze_radar(prepared, lat, lon, age_min)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Radar analysis failed: %s", exc)
-        return None, "🛰️ *เรดาร์ TMD:* วิเคราะห์ข้อมูลไม่สำเร็จ", False
-    return result, radar_line(result), True
+        return None, f"🛰️ *เรดาร์ TMD {name}:* วิเคราะห์ข้อมูลไม่สำเร็จ", False
+    if result is None:
+        return None, f"🛰️ *เรดาร์ TMD {name}:* พิกัดนี้อยู่นอกรัศมีของสถานีนี้", True
+    return result, radar_line(result, name), True
 
 
-def radar_line(radar_result):
+def radar_line(radar_result, station_name):
     """One Telegram line describing the radar nowcast."""
-    if radar_result is None:
-        return "🛰️ *เรดาร์ TMD:* พิกัดนี้อยู่นอกรัศมีเรดาร์สุวรรณภูมิ (240 กม.)"
-
-    label = "🛰️ *เรดาร์ TMD:*"
+    label = f"🛰️ *เรดาร์ TMD {station_name}:*"
     motion = ""
     if radar_result["from_direction"]:
         motion = (
@@ -346,12 +364,12 @@ def send_telegram_photo(bot_token, chat_id, photo_bytes, caption):
 def send_radar_photo(bot_token, chat_id, lat, lon, radar_result):
     """Follow up a message with the radar snapshot around (lat, lon). Best
     effort: the text message already went out, so failures are only logged."""
-    prepared = get_radar()
+    site, prepared = get_radar(lat, lon)
     if prepared is None or radar_result is None:
         return
     try:
         photo = radar.render_snapshot(prepared, lat, lon, radar_result.get("motion_px"))
-        caption = "🛰️ เรดาร์ TMD สุวรรณภูมิ (ภาพล่าสุด)\n⭕ = พิกัดที่เช็ค"
+        caption = f"🛰️ เรดาร์ TMD {site['name']} (ภาพล่าสุด)\n⭕ = พิกัดที่เช็ค"
         if radar_result.get("from_direction"):
             caption += ", เส้นสีชมพู = ทิศที่ฝนเคลื่อนเข้ามา (ยาวเท่าระยะ 30 นาที)"
         send_telegram_photo(bot_token, chat_id, photo, caption)
@@ -521,7 +539,8 @@ def check_home_alert(bot_token, chat_id, state):
             )
 
     radar_result, radar_text, _ = radar_nowcast(LATITUDE, LONGITUDE, state)
-    remember_radar(state)
+    _, home_radar = get_radar(LATITUDE, LONGITUDE)
+    remember_radar(state, home_radar)
     logger.info("Radar nowcast: %s", radar_result)
 
     now_slot = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%dT%H:%M")
