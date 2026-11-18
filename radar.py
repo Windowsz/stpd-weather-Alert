@@ -1,11 +1,14 @@
 """Rain-radar nowcasting from TMD high-quality radar loops.
 
-Each station's "Loop (240)" page shows one 1920x1600 GIF (12 frames, 15
-minutes apart, 240 km radius). The page draws it at 800 px and the Zoom
+Each station's "Loop (240)" page shows one GIF (usually 12 frames, 15
+minutes apart, 240 km radius). The page draws it smaller and the Zoom
 buttons only scale that same image. A query uses the nearest station whose
 circle covers the point, so a location outside Suvarnabhumi still gets a
-radar check. Stations whose files are a different size are left out: the
-pixel geometry would not match and the rain would be placed in the wrong spot.
+radar check. Most stations share one 1920x1600 chart. Rayong, Phetchabun
+and Trang are a different size, so they carry their own centre, km/pixel
+and colour list. Hua Hin's file is frozen in 2023, Krabi's loop is an
+out-of-service screen, and Ranong's rings could not be lined up, so those
+three are left out (a nearer live station already covers them).
 
 Frames are plain images, so we:
 
@@ -32,6 +35,8 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw
 
+import state_store
+
 logger = logging.getLogger("rain-alert")
 
 RADAR_DOWNLOAD_TIMEOUT = (10, 40)  # (connect, read) seconds; one GIF is ~15 MB
@@ -54,12 +59,59 @@ def _station(sid, name, lat, lon, path):
     return site
 
 
-# One loop per station: the 240 km high-quality GIF, and only where that file
-# is the standard 1920x1600 chart. Suvarnabhumi's lat/lon stay on the fitted
-# crosshair; the rest use the published radar coordinates.
+# Right-hand legend on the Leonardo charts. Colours sampled from the Rayong
+# loop; the same swatches appear on Phetchabun and Trang. The number is the
+# dBZ printed beside that swatch.
+_LEONARDO_PALETTE = [
+    ((252, 0, 251), 65),
+    ((229, 0, 229), 63),
+    ((213, 0, 212), 60),
+    ((198, 0, 199), 58),
+    ((184, 0, 184), 57),
+    ((170, 0, 169), 54),
+    ((170, 0, 0), 52),
+    ((195, 0, 1), 50),
+    ((234, 0, 1), 47),
+    ((255, 85, 0), 45),
+    ((255, 122, 0), 44),
+    ((255, 162, 1), 41),
+    ((254, 199, 1), 39),
+    ((254, 237, 0), 37),
+    ((0, 254, 1), 34),
+    ((0, 217, 0), 32),
+    ((0, 180, 0), 31),
+    ((2, 154, 2), 27),
+    ((1, 121, 1), 26),
+]
+
+
+def _leonardo(sid, name, lat, lon, path, center, km_per_px):
+    """A 240 km loop whose pixels are not the 1920x1600 chart.
+
+    `center` and `km_per_px` come from the crosshair and the 100/200 km rings
+    on a downloaded frame, not from scaling the HQ chart.
+    """
+    return {
+        "id": sid,
+        "name": name,
+        "lat": lat,
+        "lon": lon,
+        "url": "https://weather.tmd.go.th/" + path,
+        "center": center,
+        "km_per_px": km_per_px,
+        "range_km": 235,
+        "frame_min": 15,
+        "palette": _LEONARDO_PALETTE,
+    }
+
+
+# One loop per station. Suvarnabhumi's lat/lon stay on the fitted crosshair;
+# the rest use the published radar coordinates. The three _leonardo entries
+# are the odd-size files whose rings could be measured.
 STATIONS = [
     _station("svp", "สุวรรณภูมิ", 13.69, 100.76, "svp/svpHQloop.gif"),
     _station("skm", "สมุทรสงคราม", 13.407222, 100.031944, "skm/skmHQloop.gif"),
+    _leonardo("ryg", "ระยอง", 12.633611, 101.340556, "ryg/rygHQloop.gif", (400, 400), 0.599),
     _station("chn", "ชัยนาท", 15.157853, 100.191264, "chn/chnHQloop.gif"),
     _station("kkw", "นครนายก", 14.362222, 101.393061, "kkw/kkwHQloop.gif"),
     _station("cri", "เชียงราย", 19.961389, 99.881383, "cri/criHQloop.gif"),
@@ -67,6 +119,7 @@ STATIONS = [
     _station("mhs", "แม่ฮ่องสอน", 19.301, 97.969, "mhs/mhsHQloop.gif"),
     _station("tak", "ดอยมูเซอ", 16.752, 98.935, "tak/takHQloop.gif"),
     _station("phs", "พิษณุโลก", 16.775361, 100.217886, "phs/phsHQloop.gif"),
+    _leonardo("phb", "เพชรบูรณ์", 15.656939, 101.105272, "phb/phbHQloop.gif", (920, 920), 0.260),
     _station("kkn", "ขอนแก่น", 16.4625, 102.785881, "kkn/kknHQloop.gif"),
     _station("skn", "สกลนคร", 17.156364, 104.132592, "skn/sknHQloop.gif"),
     _station("ubn", "อุบลราชธานี", 15.243611, 104.874728, "ubn/ubnHQloop.gif"),
@@ -75,6 +128,7 @@ STATIONS = [
     _station("srt", "สุราษฎร์ธานี", 9.135556, 99.15195, "srt/srtHQloop.gif"),
     _station("pkt", "ภูเก็ต", 8.133611, 98.329444, "pkt/pktHQloop.gif"),
     _station("stp", "สทิงพระ", 7.449994, 100.459994, "stp/stpHQloop.gif"),
+    _leonardo("trg", "ตรัง", 7.512296, 99.620703, "trg/trgHQloop.gif", (960, 960), 0.250),
     _station("hyi", "หาดใหญ่", 6.933, 100.393, "hyi/hyiHQloop.gif"),
     _station("nrt", "นราธิวาส", 6.426667, 101.825164, "nrt/nrtHQloop.gif"),
 ]
@@ -138,8 +192,15 @@ def stations_covering(lat, lon):
 
 
 def build_palette(frame, site):
-    """Read the colour bar of a frame -> (colors Nx3, dbz N) excluding the
-    bottom (blue, <9.5 dBZ) swatch, which is indistinguishable from noise."""
+    """Colour bar of a frame -> (colors Nx3, dbz N).
+
+    Leonardo stations carry an explicit list (the legend is on the right and
+    the steps are not the HQ scale). HQ stations are read from the left bar,
+    skipping the bottom blue swatch, which is indistinguishable from noise."""
+    if site.get("palette"):
+        colors = [np.array(color) for color, _ in site["palette"]]
+        dbz = [value for _, value in site["palette"]]
+        return np.array(colors), np.array(dbz)
     colors, dbz = [], []
     for k in range(BAR_SWATCHES - 1):
         y = int(site["bar_y"] + (k + 0.5) * site["bar_swatch"])
@@ -358,18 +419,83 @@ def analyze_radar(prepared, lat, lon, age_min=0):
     return result
 
 
+def _content_fingerprint(length, head, tail):
+    return f"{length}:{hashlib.sha1(head + tail).hexdigest()}"
+
+
+def _probe_radar(site):
+    """Cheap look at the file: (fingerprint, full_bytes or None).
+
+    A Range request is enough to tell whether Redis already holds this GIF.
+    When the server ignores Range and sends the whole file, full_bytes is set
+    and the caller must not download it again.
+    """
+    head = requests.get(
+        site["url"], headers={"Range": "bytes=0-65535"}, timeout=(10, 20)
+    )
+    head.raise_for_status()
+    if head.status_code == 200 and "Content-Range" not in head.headers:
+        body = head.content
+        fp = _content_fingerprint(len(body), body[:65536], body[-65536:])
+        return fp, body
+    total = ""
+    content_range = head.headers.get("Content-Range", "")
+    if "/" in content_range:
+        total = content_range.rsplit("/", 1)[-1]
+    if not total.isdigit():
+        return None, None
+    tail = requests.get(
+        site["url"], headers={"Range": "bytes=-65536"}, timeout=(10, 20)
+    )
+    tail.raise_for_status()
+    return _content_fingerprint(int(total), head.content, tail.content), None
+
+
+def _download_radar_bytes(site):
+    """GIF bytes, from Redis when the file has not changed, else from TMD."""
+    fingerprint, whole = None, None
+    try:
+        fingerprint, whole = _probe_radar(site)
+    except requests.RequestException as exc:
+        logger.info("Radar probe failed for %s (%s); downloading the whole file.", site["id"], exc)
+    if whole is not None:
+        _remember_radar_bytes(site, fingerprint, whole)
+        return whole
+    if fingerprint:
+        cached = state_store.radar_cache_get(site["id"], fingerprint)
+        if cached:
+            logger.info("Radar %s served from Redis cache.", site["id"])
+            return cached
+    response = requests.get(site["url"], timeout=RADAR_DOWNLOAD_TIMEOUT)
+    response.raise_for_status()
+    content = response.content
+    fp = _content_fingerprint(len(content), content[:65536], content[-65536:])
+    _remember_radar_bytes(site, fp, content)
+    return content
+
+
+def _remember_radar_bytes(site, fingerprint, content):
+    if not fingerprint or len(content) > state_store.RADAR_CACHE_MAX_BYTES:
+        if fingerprint:
+            logger.info("Radar %s is %d bytes; leaving it out of Redis.", site["id"], len(content))
+        return
+    try:
+        state_store.radar_cache_put(site["id"], fingerprint, content)
+    except Exception as exc:  # noqa: BLE001 - a cache miss next time is fine
+        logger.warning("Could not cache radar %s: %s", site["id"], exc)
+
+
 def fetch_radar(site):
     """Download one station's radar loop and prepare it for analyze_radar().
     Returns None on any failure so radar problems never break the alert run."""
     try:
         logger.info("Fetching TMD radar loop for %s...", site["id"])
-        response = requests.get(site["url"], timeout=RADAR_DOWNLOAD_TIMEOUT)
-        response.raise_for_status()
-        frames = load_frames(response.content, keep_last=2)
+        content = _download_radar_bytes(site)
+        frames = load_frames(content, keep_last=2)
         logger.info("Radar loop fetched for %s (%d frames).", site["id"], len(frames))
         prepared = prepare_radar(frames, site)
         # Fingerprint of the content: unchanged for long = TMD stopped updating.
-        prepared["digest"] = hashlib.sha1(response.content).hexdigest()
+        prepared["digest"] = hashlib.sha1(content).hexdigest()
         return prepared
     except Exception as exc:  # noqa: BLE001 - radar is optional; log and carry on
         logger.warning("Could not fetch/decode radar loop for %s: %s", site["id"], exc)

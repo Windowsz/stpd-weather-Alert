@@ -33,12 +33,12 @@ HOME_COORD_TOLERANCE = 0.001  # ~110m, for matching a shared pin to home
 
 # A model "votes rain" when, anywhere in the look-ahead window, its rain amount
 # reaches RAIN_AMOUNT_THRESHOLD and (if it reports one) its probability reaches
-# RAIN_PROBABILITY_THRESHOLD. An alert needs MIN_MODEL_VOTES models to agree.
+# RAIN_PROBABILITY_THRESHOLD. MIN_MODEL_VOTES is only how the message describes
+# the models. The scheduled home alert is sent only when the radar triggers.
 FORECAST_MODELS = ("ecmwf_ifs025", "icon_global", "gfs_global")
 MIN_MODEL_VOTES = 2
 WINDOW_HOURS = 3  # hourly slots looked at, starting with the current hour
-ALERT_COOLDOWN_HOURS = 2  # don't re-alert on the models for the same rain spell
-RADAR_ALERT_COOLDOWN_MIN = 60  # radar alerts have their own, shorter cooldown
+RADAR_ALERT_COOLDOWN_MIN = 60  # don't repeat a radar alert inside this window
 RADAR_MAX_AGE_MIN = 40  # HQ frames come every 15 min; content unchanged this long = TMD stopped updating
 RAIN_PROBABILITY_THRESHOLD = 40  # percent
 RAIN_AMOUNT_THRESHOLD = 0.5  # mm per hour
@@ -523,13 +523,12 @@ def fetch_forecast_analysis(lat, lon):
 
 
 def check_home_alert(bot_token, chat_id, state):
-    """Check the home location and send an alert if enough models expect rain
-    in the next few hours, or the radar shows rain over / approaching home.
+    """Check the home location and send an alert only when the radar shows
+    rain over or approaching home.
 
-    Model alerts are spaced ALERT_COOLDOWN_HOURS apart and radar alerts
-    RADAR_ALERT_COOLDOWN_MIN apart (tracked separately in `state`), so a model
-    alert never silences a later "rain arriving in N minutes" radar alert, and
-    running frequently doesn't spam repeats."""
+    The three forecast models are still fetched and written into the message,
+    but they never send an alert on their own. Radar alerts are spaced
+    RADAR_ALERT_COOLDOWN_MIN apart, and a run with no radar rain sends nothing."""
     analysis = fetch_forecast_analysis(LATITUDE, LONGITUDE)
     if analysis:
         for name, m in analysis["models"].items():
@@ -546,39 +545,32 @@ def check_home_alert(bot_token, chat_id, state):
     now_slot = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%dT%H:%M")
     model_triggered = bool(analysis and analysis["triggered"])
     radar_triggered = bool(radar_result and radar_result["triggered"])
-    model_due = model_triggered and not is_in_cooldown(
-        state.get("last_home_alert_time"), analysis["window_start"],
-        timedelta(hours=ALERT_COOLDOWN_HOURS),
-    )
     radar_due = radar_triggered and not is_in_cooldown(
         state.get("last_radar_alert_time"), now_slot,
         timedelta(minutes=RADAR_ALERT_COOLDOWN_MIN),
     )
 
-    if not (model_due or radar_due):
-        if model_triggered or radar_triggered:
-            logger.info("Rain expected but already alerted recently (cooldown), skipping.")
+    if not radar_due:
+        if radar_triggered:
+            logger.info("Radar sees rain but already alerted recently (cooldown), skipping.")
+        elif model_triggered:
+            logger.info("Models expect rain but the radar does not, skipping.")
         else:
-            logger.info("No alert needed (models and radar don't expect rain).")
+            logger.info("No alert needed (radar does not see rain).")
         return
 
-    logger.info("Rain condition triggered (models=%s, radar=%s). Sending alert...",
-                model_triggered, radar_triggered)
+    logger.info("Radar rain triggered (models=%s). Sending alert...", model_triggered)
     message = build_alert_message(LATITUDE, LONGITUDE, analysis, radar_text)
 
     try:
         send_telegram_message(bot_token, chat_id, message)
     except requests.RequestException as exc:
-        # Cooldowns aren't updated, so the next run retries.
+        # Cooldown isn't updated, so the next run retries.
         logger.error("Failed to send Telegram alert: %s", exc)
         return
 
     send_radar_photo(bot_token, chat_id, LATITUDE, LONGITUDE, radar_result)
-
-    if model_triggered:
-        state["last_home_alert_time"] = analysis["window_start"]
-    if radar_triggered:
-        state["last_radar_alert_time"] = now_slot
+    state["last_radar_alert_time"] = now_slot
 
 
 def handle_message(bot_token, allowed_chat_id, message, state=None):
