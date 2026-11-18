@@ -1,0 +1,13 @@
+﻿# Secrets and local tooling
+.env
+.env.*
+.vercel/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime state rewritten by the scheduled check
+data/state.json
