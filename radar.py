@@ -147,6 +147,7 @@ MOTION_BLUR_PX = 6  # Gaussian sigma applied before correlating
 MOTION_MIN_ECHO_PX = 150  # need this many echo pixels in both frames to trust motion
 MOTION_MAX_KMH = 100
 LEAD_MAX_MIN = 60  # how far ahead to extrapolate
+CLEAR_MAX_MIN = 60  # how long after rain starts to keep looking for its trailing edge
 
 # Telegram snapshot: latest frame cropped around the point.
 SNAPSHOT_HALF_KM = 60
@@ -299,6 +300,45 @@ def max_dbz_near(field, point_px, radius_km, site):
     return float(patch[disc].max()) if disc.any() else 0.0
 
 
+def _sample_inside(point, motion, minutes, site):
+    """True when the echo that reaches the point after `minutes` is still inside
+    the radar circle. Past the circle a zero reading is missing data, not clear sky."""
+    if motion is None:
+        return True
+    frac = minutes / site["frame_min"]
+    x = point[0] - motion[0] * frac
+    y = point[1] - motion[1] * frac
+    cx, cy = site["center"]
+    return math.hypot(x - cx, y - cy) * site["km_per_px"] <= site["range_km"] - 15
+
+
+def _clearance(dbz_at, motion, point, site, age_min, eta_min):
+    """(minutes from now until rain drops below the threshold, still_raining).
+
+    Looks down the trailing edge for CLEAR_MAX_MIN after the rain starts.
+    A zero beyond the radar circle stops the search: the edge was never seen,
+    so the second value is True instead of inventing an end time.
+    """
+    if eta_min is None or motion is None:
+        return None, False
+    start = age_min if eta_min == 0 else age_min + eta_min
+    speed_px = math.hypot(*motion)
+    if speed_px <= 0:
+        return None, True
+    path_px = speed_px * CLEAR_MAX_MIN / site["frame_min"]
+    radius_px = TARGET_RADIUS_KM / site["km_per_px"]
+    steps = max(6, math.ceil(path_px / radius_px))
+    for i in range(1, steps + 1):
+        lead = CLEAR_MAX_MIN * i / steps
+        when = start + lead
+        if not _sample_inside(point, motion, when, site):
+            return None, True
+        if dbz_at(when) < RADAR_DBZ_THRESHOLD:
+            minutes_from_now = max(5, int(round((when - age_min) / 5)) * 5)
+            return minutes_from_now, False
+    return None, True
+
+
 def _bearing_text(dx, dy):
     """Compass direction the echoes are coming FROM (Thai)."""
     # Echoes move by (dx, dy) in image coords (y down); they come from the opposite side.
@@ -362,7 +402,10 @@ def analyze_radar(prepared, lat, lon, age_min=0):
     Returns None if the point is outside radar coverage, else a dict:
       now_dbz, motion_kmh / from_direction (or None), eta_min (minutes from now,
       None if no rain expected within LEAD_MAX_MIN), peak_dbz (echo that will
-      reach the point), triggered.
+      reach the point), triggered, clear_min (minutes from now until the echo
+      drops back below the rain threshold; None if that edge is not visible),
+      rain_persists (True when rain is still over the point at the end of the
+      clearance window).
     """
     site = prepared["site"]
     point = latlon_to_px(lat, lon, site)
@@ -403,10 +446,14 @@ def analyze_radar(prepared, lat, lon, age_min=0):
                 peak_dbz = dbz
                 break
 
+    clear_min, rain_persists = _clearance(dbz_arriving_after, motion, point, site, age_min, eta_min)
+
     result = {
         "now_dbz": now_dbz,
         "peak_dbz": peak_dbz,
         "eta_min": eta_min,
+        "clear_min": clear_min,
+        "rain_persists": rain_persists,
         "motion_px": motion,
         "motion_kmh": None,
         "from_direction": None,

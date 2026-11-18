@@ -261,14 +261,32 @@ def radar_line(radar_result, station_name):
         rate = radar.dbz_to_rain_rate(radar_result["now_dbz"])
         return (
             f"{label} น่าจะมีฝนเหนือพื้นที่ตอนนี้ "
-            f"(`{radar_result['now_dbz']:.0f} dBZ` ≈ {rate:.1f} มม./ชม.){motion}"
+            f"(`{radar_result['now_dbz']:.0f} dBZ` ≈ {rate:.1f} มม./ชม.)"
+            f"{_clear_text(radar_result)}{motion}"
         )
     if radar_result["eta_min"] is not None:
         return (
             f"{label} คาดว่าฝนจะถึงใน ~{radar_result['eta_min']} นาที "
-            f"(`{radar_result['peak_dbz']:.0f} dBZ`){motion}"
+            f"(`{radar_result['peak_dbz']:.0f} dBZ`)"
+            f"{_clear_text(radar_result)}{motion}"
         )
     return f"{label} ยังไม่พบฝนใกล้พื้นที่ใน 1 ชั่วโมงข้างหน้า{motion}"
+
+
+def _clear_text(radar_result):
+    """How long the echo stays over the point, when the trailing edge is visible."""
+    clear_min = radar_result.get("clear_min")
+    eta = radar_result.get("eta_min")
+    if clear_min is not None and eta is not None:
+        if eta == 0:
+            return f" น่าจะเคลื่อนพ้นไปใน ~{clear_min} นาที"
+        stay = max(5, clear_min - eta)
+        return f" พอถึงแล้ว น่าจะตกอยู่ราว {stay} นาที"
+    if radar_result.get("rain_persists"):
+        if eta:
+            return f" พอถึงแล้ว ยังไม่เห็นขอบกลุ่มฝนใน {radar.CLEAR_MAX_MIN} นาที"
+        return f" ยังไม่เห็นขอบกลุ่มฝนใน {radar.CLEAR_MAX_MIN} นาที"
+    return ""
 
 
 def _model_lines(analysis):
