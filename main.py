@@ -593,13 +593,46 @@ def check_home_alert(bot_token, chat_id, state):
     state["last_radar_alert_time"] = now_slot
 
 
+_HELP_COMMANDS = {"/help", "/start", "help", "ช่วยเหลือ", "วิธีใช้"}
+
+
+def _is_help(text):
+    cleaned = re.sub(r"^(/[^\s@]+)@\S+", r"\1", (text or "").strip())
+    return cleaned.lower() in _HELP_COMMANDS
+
+
+def _help_text():
+    return (
+        "วิธีใช้\n\n"
+        "เช็คฝน ส่งอย่างใดอย่างหนึ่ง\n"
+        "• แชร์ Location จากปุ่มคลิปหนีบกระดาษ\n"
+        "• ลิงก์ Google Maps\n"
+        "• พิกัด เช่น 13.76, 100.56\n"
+        "ถามเมื่อไรก็ตอบ แม้ไม่มีฝน\n\n"
+        "เตือนความจำ\n"
+        "• เตือน 18:00 รับพัสดุ\n"
+        "• เตือน พรุ่งนี้ 9:00 ประชุม\n"
+        "• รายการเตือน\n"
+        "• ลบเตือน 1\n"
+        "ส่งตามรอบเช็ค อาจช้าได้ไม่กี่นาที\n\n"
+        "บ้านเตือนเองเมื่อเรดาร์เห็นฝน และไม่ส่งถ้าไม่มีฝน"
+    )
+
+
 def handle_message(bot_token, allowed_chat_id, message, state=None):
     """Reply to one Telegram message that contains a Google Maps link, a shared
     location or a bare 'lat, lon' with the rain forecast for that spot.
-    Messages from other chats, or without a location, are ignored."""
+    /help lists the commands. Messages from other chats are ignored."""
     chat_id = message.get("chat", {}).get("id")
     if str(chat_id) != str(allowed_chat_id):
         logger.info("Ignoring message from unrecognized chat_id=%s.", chat_id)
+        return
+
+    if _is_help(message.get("text") or ""):
+        try:
+            send_telegram_message(bot_token, chat_id, _help_text(), parse_mode=None)
+        except requests.RequestException as exc:
+            logger.warning("Could not send the help reply: %s", exc)
         return
 
     reminder_reply = reminders.handle_text(

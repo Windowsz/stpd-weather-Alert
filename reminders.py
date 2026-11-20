@@ -116,7 +116,8 @@ def _list_text(items, now):
     if not items:
         return (
             "ยังไม่มีเตือนความจำ\n"
-            "ตั้งด้วย เตือน 18:00 รับพัสดุ หรือ เตือน พรุ่งนี้ 9:00 ประชุม"
+            "ตั้งด้วย เตือน 18:00 รับพัสดุ หรือ เตือน พรุ่งนี้ 9:00 ประชุม\n"
+            "ดูคำสั่งทั้งหมดด้วย /help"
         )
     lines = ["เตือนความจำที่จำไว้"]
     for index, item in enumerate(sorted(items, key=lambda item: item["at"]), start=1):
