@@ -32,12 +32,22 @@ class handler(BaseHTTPRequestHandler):
             send_json(self, 500, {"error": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set"})
             return
 
+        rain_failed = False
+        state = None
         try:
             state = state_store.load_state()
             main.check_home_alert(bot_token, chat_id, state)
             state_store.save_state(state)
         except Exception:  # noqa: BLE001 - report instead of a bare 500
             logger.exception("Home check failed")
+            rain_failed = True
+
+        try:
+            main.dispatch_reminders(bot_token, chat_id, state)
+        except Exception:  # noqa: BLE001 - a reminder must not hide the rain result
+            logger.exception("Reminder dispatch failed")
+
+        if rain_failed:
             send_json(self, 500, {"error": "check failed, see function logs"})
             return
 

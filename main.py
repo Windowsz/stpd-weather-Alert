@@ -2,12 +2,12 @@
 """Rain Alert - checks Open-Meteo forecasts and the TMD rain radar and sends
 Telegram alerts.
 
-Two features:
-1. Scheduled home-location check: alerts if enough forecast models expect
-   rain in the next few hours, or the radar shows rain over / approaching home.
-2. On-demand query: if the user sends a Google Maps link (or shares a
-   location) in the Telegram chat, the bot replies with the rain forecast
-   for that spot.
+Three features:
+1. Scheduled home-location check: alerts when the radar shows rain over
+   or approaching home. The forecast models are included in the message.
+2. On-demand query: a Google Maps link, a shared location, or "lat, lon"
+   always gets a reply.
+3. Personal reminders: "เตือน 18:00 ..." is delivered by the 5-minute cron.
 """
 
 import json
@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 import radar
+import reminders
 
 # Home location used for the scheduled alert.
 LATITUDE = 13.8628558
@@ -350,15 +351,16 @@ def build_query_reply_message(lat, lon, analysis, radar_text="", radar_triggered
     )
 
 
-def send_telegram_message(bot_token, chat_id, message):
-    """Send a Markdown-formatted message to a Telegram chat."""
+def send_telegram_message(bot_token, chat_id, message, parse_mode="Markdown"):
+    """Send a message to a Telegram chat. parse_mode=None sends the text literally."""
     url = f"{TELEGRAM_API_BASE.format(token=bot_token)}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": message,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
 
     logger.info("Sending message to Telegram chat_id=%s...", chat_id)
     response = requests.post(url, data=payload, timeout=15)
@@ -600,6 +602,16 @@ def handle_message(bot_token, allowed_chat_id, message, state=None):
         logger.info("Ignoring message from unrecognized chat_id=%s.", chat_id)
         return
 
+    reminder_reply = reminders.handle_text(
+        message.get("text") or "", state, datetime.now(BANGKOK_TZ),
+    )
+    if reminder_reply is not None:
+        try:
+            send_telegram_message(bot_token, chat_id, reminder_reply, parse_mode=None)
+        except requests.RequestException as exc:
+            logger.warning("Could not send the reminder reply: %s", exc)
+        return
+
     try:
         coords = extract_query_location(message)
     except Exception as exc:  # noqa: BLE001 - a bad message must not break the caller
@@ -680,6 +692,30 @@ def process_location_queries(bot_token, allowed_chat_id, state):
     state["last_update_id"] = highest_update_id
 
 
+def dispatch_reminders(bot_token, chat_id, state=None):
+    """Send reminders whose time has come. A failed send stays queued."""
+    now = datetime.now(BANGKOK_TZ)
+    try:
+        due = reminders.due_reminders(state, now)
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        logger.warning("Could not read reminders: %s", exc)
+        return
+    sent = []
+    for item in due:
+        try:
+            send_telegram_message(
+                bot_token, chat_id, f"⏰ เตือนความจำ\n{item['text']}", parse_mode=None,
+            )
+        except requests.RequestException as exc:
+            logger.warning("Could not deliver reminder %s: %s", item.get("id"), exc)
+            break
+        sent.append(item["id"])
+    try:
+        reminders.forget(state, sent)
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        logger.warning("Could not clear delivered reminders: %s", exc)
+
+
 def main():
     """Local run: one home check plus polling for queries, with state in
     data/state.json. Production runs on Vercel (see api/)."""
@@ -696,6 +732,7 @@ def main():
     state = load_state()
     check_home_alert(bot_token, chat_id, state)
     process_location_queries(bot_token, chat_id, state)
+    dispatch_reminders(bot_token, chat_id, state)
     save_state(state)
 
     logger.info("Done.")

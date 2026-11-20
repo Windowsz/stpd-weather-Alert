@@ -13,6 +13,7 @@ import os
 import requests
 
 STATE_KEY = "rain-alert:state"
+REMINDERS_KEY = "rain-alert:reminders"
 UPDATE_KEY_PREFIX = "rain-alert:update:"
 UPDATE_DEDUP_SECONDS = 24 * 3600
 RADAR_KEY_PREFIX = "rain-alert:radar:"
@@ -143,6 +144,44 @@ def radar_cache_put(site_id, fingerprint, data):
     # A few keys per request so a 15 MB GIF stays under the REST body limit.
     for start in range(0, len(commands), 4):
         _pipeline(commands[start:start + 4])
+
+
+def reminders_enabled():
+    """True when Redis is configured. Local runs keep reminders in the state file."""
+    try:
+        _config()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _hash_pairs(result):
+    if isinstance(result, dict):
+        return list(result.items())
+    if isinstance(result, list):
+        return list(zip(result[::2], result[1::2]))
+    return []
+
+
+def reminders_all():
+    """Every stored reminder as a dict with id, at, text."""
+    raw = _command("HGETALL", REMINDERS_KEY)
+    items = []
+    for _, value in _hash_pairs(raw):
+        try:
+            items.append(json.loads(value))
+        except (TypeError, ValueError):
+            continue
+    return items
+
+
+def reminders_put(reminder_id, item):
+    _command("HSET", REMINDERS_KEY, reminder_id, json.dumps(item, ensure_ascii=False))
+
+
+def reminders_delete(ids):
+    if ids:
+        _command("HDEL", REMINDERS_KEY, *ids)
 
 
 def claim_update(update_id):
